@@ -17,8 +17,7 @@ try:
 except ImportError:
     import tomli as tomllib
 
-from flashinfer_bench import BuildSpec
-from flashinfer_bench.agents import pack_solution_from_files
+from flashinfer_bench import BuildSpec, Solution, SourceFile
 
 
 def load_config() -> dict:
@@ -29,6 +28,57 @@ def load_config() -> dict:
 
     with open(config_path, "rb") as f:
         return tomllib.load(f)
+
+
+def _resolve_entry_point(source_dir: Path, entry_point: str, language: str) -> str:
+    """Resolve entry point to '<relative_file>::<function>' format."""
+    if "::" in entry_point:
+        return entry_point
+
+    if language in {"triton", "python"}:
+        exts = {".py"}
+    elif language == "cuda":
+        exts = {".cu", ".cpp", ".cc", ".cxx", ".c"}
+    else:
+        raise ValueError(f"Unsupported language: {language}")
+
+    candidates = sorted(
+        [
+            path
+            for path in source_dir.rglob("*")
+            if path.is_file() and path.suffix in exts
+        ]
+    )
+    if not candidates:
+        raise FileNotFoundError(f"No source files found under: {source_dir}")
+
+    preferred = [p for p in candidates if p.stem == "kernel"]
+    if preferred:
+        entry_file = preferred[0]
+    elif len(candidates) == 1:
+        entry_file = candidates[0]
+    else:
+        raise ValueError(
+            "Multiple source files found. Set build.entry_point to '<file>::<fn>'."
+        )
+
+    rel_path = entry_file.relative_to(source_dir).as_posix()
+    return f"{rel_path}::{entry_point}"
+
+
+def _collect_sources(source_dir: Path) -> list[SourceFile]:
+    sources: list[SourceFile] = []
+    skip_dirs = {"__pycache__", ".git", ".pytest_cache"}
+    skip_exts = {".pyc", ".pyo", ".so", ".o"}
+    for path in sorted([p for p in source_dir.rglob("*") if p.is_file()]):
+        # Skip cache directories and binary files
+        if any(d in path.parts for d in skip_dirs):
+            continue
+        if path.suffix in skip_exts:
+            continue
+        rel_path = path.relative_to(source_dir).as_posix()
+        sources.append(SourceFile(path=rel_path, content=path.read_text()))
+    return sources
 
 
 def pack_solution(output_path: Path = None) -> Path:
@@ -46,26 +96,33 @@ def pack_solution(output_path: Path = None) -> Path:
         source_dir = PROJECT_ROOT / "solution" / "triton"
     elif language == "cuda":
         source_dir = PROJECT_ROOT / "solution" / "cuda"
+    elif language == "python":
+        source_dir = PROJECT_ROOT / "solution" / "python"
     else:
         raise ValueError(f"Unsupported language: {language}")
 
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
+    resolved_entry_point = _resolve_entry_point(source_dir, entry_point, language)
+    sources = _collect_sources(source_dir)
+
     # Create build spec
     spec = BuildSpec(
         language=language,
         target_hardware=["cuda"],
-        entry_point=entry_point,
+        entry_point=resolved_entry_point,
     )
 
-    # Pack the solution
-    solution = pack_solution_from_files(
-        path=str(source_dir),
-        spec=spec,
+    solution = Solution(
         name=solution_config["name"],
         definition=solution_config["definition"],
         author=solution_config["author"],
+        spec=spec,
+        sources=sources,
+        description=solution_config.get(
+            "description", f"Custom kernel for {solution_config['definition']}"
+        ),
     )
 
     # Write to output file
