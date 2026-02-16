@@ -4,6 +4,7 @@ Fused MoE Triton Kernel - Evolved by KernelEvolve.
 FlashInfer entry: kernel.py::kernel
 """
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -34,7 +35,6 @@ def grouped_gemm1_swiglu_kernel(
     stride_om, stride_on,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
 ):
-    # Align pointers
     A_ptr = tl.multiple_of(A_ptr, 16)
     A_scale_ptr = tl.multiple_of(A_scale_ptr, 16)
     W_ptr = tl.multiple_of(W_ptr, 16)
@@ -70,8 +70,7 @@ def grouped_gemm1_swiglu_kernel(
     token_idx = tl.load(token_sorted_ptr + row_ids, mask=m_mask, other=0)
 
     a_scale_base = A_scale_ptr + token_idx[:, None] * stride_asm
-    # Scales for weights. Assume 128 block size for scaling.
-    # When BLOCK_N > 128, this correctly maps columns to their scale blocks
+
     ws_ptr_gate = W_scale_ptr + expert_id * stride_wse + (offs_n[None, :] // 128) * stride_wsn
     ws_ptr_up   = W_scale_ptr + expert_id * stride_wse + ((offs_n[None, :] + H) // 128) * stride_wsn
 
@@ -81,23 +80,18 @@ def grouped_gemm1_swiglu_kernel(
     for k in range(0, K, BLOCK_K):
         k_mask = (k + offs_k) < K
 
-        # Load A (Activation)
         a_ptr_k = A_ptr + token_idx[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak
-        a = tl.load(a_ptr_k, mask=m_mask[:, None] & k_mask[None, :], other=0.0).to(tl.float32)
+        a = tl.load(a_ptr_k, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
 
-        # Load W (Gate)
         w_ptr_gate = W_ptr + expert_id * stride_we + offs_n[None, :] * stride_wn + (k + offs_k[:, None]) * stride_wk
-        b_gate = tl.load(w_ptr_gate, mask=n_mask[None, :] & k_mask[:, None], other=0.0).to(tl.float32)
+        b_gate = tl.load(w_ptr_gate, mask=n_mask[None, :] & k_mask[:, None], other=0.0)
 
-        # Load W (Up)
         w_ptr_up = W_ptr + expert_id * stride_we + (offs_n[None, :] + H) * stride_wn + (k + offs_k[:, None]) * stride_wk
-        b_up = tl.load(w_ptr_up, mask=n_mask[None, :] & k_mask[:, None], other=0.0).to(tl.float32)
+        b_up = tl.load(w_ptr_up, mask=n_mask[None, :] & k_mask[:, None], other=0.0)
 
-        # Dot Product
         p_gate = tl.dot(a, b_gate)
         p_up   = tl.dot(a, b_up)
 
-        # Apply Scales
         k_blk = k // 128
         sa = tl.load(a_scale_base + k_blk * stride_ask, mask=m_mask[:, None], other=1.0)
         sw_gate = tl.load(ws_ptr_gate + k_blk * stride_wsk, mask=n_mask[None, :], other=1.0)
@@ -106,7 +100,6 @@ def grouped_gemm1_swiglu_kernel(
         acc_gate += p_gate * sa * sw_gate
         acc_up   += p_up   * sa * sw_up
 
-    # SwiGLU: gate * sigmoid(gate) * up
     out = acc_gate * (acc_up * tl.sigmoid(acc_up))
 
     out_ptr_base = Out_ptr + row_ids[:, None] * stride_om + offs_n[None, :] * stride_on
@@ -114,7 +107,7 @@ def grouped_gemm1_swiglu_kernel(
 
 
 @triton.jit
-def grouped_gemm2_kernel(
+def grouped_gemm2_atomic_kernel(
     C_ptr,
     W_ptr, W_scale_ptr,
     Out_ptr,
@@ -158,8 +151,9 @@ def grouped_gemm2_kernel(
     n_mask = offs_n < N
 
     row_ids = tok_start + offs_m
-    gating_w = tl.load(Weight_ptr + row_ids, mask=m_mask, other=0.0)
+
     token_idx = tl.load(token_sorted_ptr + row_ids, mask=m_mask, other=0)
+    gating_w = tl.load(Weight_ptr + row_ids, mask=m_mask, other=0.0)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     w_scale_base = W_scale_ptr + expert_id * stride_wse + (offs_n[None, :] // 128) * stride_wsn
@@ -167,28 +161,23 @@ def grouped_gemm2_kernel(
     for k in range(0, K, BLOCK_K):
         k_mask = (k + offs_k) < K
 
-        # Load C (Activation) - FP32
         c = tl.load(
             C_ptr + row_ids[:, None] * stride_cm + (k + offs_k[None, :]) * stride_ck,
             mask=m_mask[:, None] & k_mask[None, :],
             other=0.0
         )
 
-        # Load W (Weights) - FP8
         w_ptr_k = W_ptr + expert_id * stride_we + offs_n[None, :] * stride_wn + (k + offs_k[:, None]) * stride_wk
         w_fp8 = tl.load(w_ptr_k, mask=n_mask[None, :] & k_mask[:, None], other=0.0)
 
-        # Scale loading
         k_blk = k // 128
         sw = tl.load(w_scale_base + k_blk * stride_wsk, mask=n_mask[None, :], other=1.0)
 
-        # Explicit dequantization to float32 for stability
         w_dequant = w_fp8.to(tl.float32) * sw
         acc += tl.dot(c, w_dequant)
 
     acc = acc * gating_w[:, None]
 
-    # Atomic add to final output using original token indices
     out_ptrs = Out_ptr + token_idx[:, None] * stride_om + offs_n[None, :] * stride_on
     tl.atomic_add(out_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
 
@@ -244,7 +233,7 @@ def build_local_dispatch(
 
     local_mask = (topk_idx >= local_start) & (topk_idx < local_start + E_LOCAL)
     if not local_mask.any():
-        return None, None, None, None
+        return None, None, None
 
     local_tokens = token_ids[local_mask]
     local_experts = (topk_idx[local_mask] - local_start).to(torch.int64)
@@ -260,8 +249,7 @@ def build_local_dispatch(
     offsets = torch.zeros(E_LOCAL + 1, device=device, dtype=torch.int32)
     offsets[1:] = counts.cumsum(0).to(torch.int32)
 
-    max_tokens = int(counts.max().item())
-    return token_sorted, weight_sorted, offsets, max_tokens
+    return token_sorted, weight_sorted, offsets
 
 
 # =========================
@@ -307,7 +295,7 @@ def custom_kernel(
             out_fp32.zero_()
 
     local_start = int(local_expert_offset)
-    token_sorted, weight_sorted, offsets, max_tokens = build_local_dispatch(topk_idx, weights, local_start)
+    token_sorted, weight_sorted, offsets = build_local_dispatch(topk_idx, weights, local_start)
     if token_sorted is None:
         if out_target is not None and out_target is not out_fp32:
             out_target.zero_()
@@ -316,23 +304,19 @@ def custom_kernel(
 
     num_assignments = token_sorted.shape[0]
 
-    # Optimized tile sizes for B200 TF32 throughput and atomic efficiency
-    # GEMM1: Standard SwiGLU tiling
-    BLOCK_M = 64
-    BLOCK_N1 = 128
-    BLOCK_K1 = 128
+    BLOCK_M_1 = 64
+    BLOCK_N_1 = 128
+    BLOCK_K_1 = 128
 
-    # GEMM2: Balanced for atomic scatter (N=256 reduces atomic contention vs 512)
-    BLOCK_N2 = 256
-    BLOCK_K2 = 64
+    BLOCK_M_2 = 64
+    BLOCK_N_2 = 256
+    BLOCK_K_2 = 64
 
     H_gemm1 = N1 // 2
 
-    # Intermediate C_act in FP32 for stability
     C_act = torch.empty((num_assignments, H_gemm1), device=device, dtype=torch.float32)
 
-    # Static grid launch (no sync)
-    grid_1 = (triton.cdiv(max_tokens, BLOCK_M), triton.cdiv(H_gemm1, BLOCK_N1), E_LOCAL)
+    grid_1 = (triton.cdiv(T, BLOCK_M_1), triton.cdiv(H_gemm1, BLOCK_N_1), E_LOCAL)
     grouped_gemm1_swiglu_kernel[grid_1](
         hidden_states, A_scale, token_sorted, offsets,
         gemm1_weights, gemm1_weights_scale,
@@ -342,12 +326,12 @@ def custom_kernel(
         gemm1_weights.stride(0), gemm1_weights.stride(1), gemm1_weights.stride(2),
         gemm1_weights_scale.stride(0), gemm1_weights_scale.stride(1), gemm1_weights_scale.stride(2),
         C_act.stride(0), C_act.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N1, BLOCK_K=BLOCK_K1,
-        num_warps=16, num_stages=3
+        BLOCK_M=BLOCK_M_1, BLOCK_N=BLOCK_N_1, BLOCK_K=BLOCK_K_1,
+        num_warps=8, num_stages=4
     )
 
-    grid_2 = (triton.cdiv(max_tokens, BLOCK_M), triton.cdiv(N2, BLOCK_N2), E_LOCAL)
-    grouped_gemm2_kernel[grid_2](
+    grid_2 = (triton.cdiv(T, BLOCK_M_2), triton.cdiv(N2, BLOCK_N_2), E_LOCAL)
+    grouped_gemm2_atomic_kernel[grid_2](
         C_act,
         gemm2_weights, gemm2_weights_scale,
         out_fp32,
@@ -358,8 +342,8 @@ def custom_kernel(
         gemm2_weights.stride(0), gemm2_weights.stride(1), gemm2_weights.stride(2),
         gemm2_weights_scale.stride(0), gemm2_weights_scale.stride(1), gemm2_weights_scale.stride(2),
         out_fp32.stride(0), out_fp32.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N2, BLOCK_K=BLOCK_K2,
-        num_warps=8, num_stages=3
+        BLOCK_M=BLOCK_M_2, BLOCK_N=BLOCK_N_2, BLOCK_K=BLOCK_K_2,
+        num_warps=8, num_stages=4
     )
 
     if out_target is not None:
