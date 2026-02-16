@@ -33,16 +33,23 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
     trace_set_path = get_trace_set_path()
+    print(f"Loading trace set from: {trace_set_path}")
     trace_set = TraceSet.from_path(trace_set_path)
 
     if solution.definition not in trace_set.definitions:
-        raise ValueError(f"Definition '{solution.definition}' not found in trace set")
+        available = list(trace_set.definitions.keys())
+        raise ValueError(
+            f"Definition '{solution.definition}' not found in trace set.\n"
+            f"Available definitions: {available}"
+        )
 
     definition = trace_set.definitions[solution.definition]
     workloads = trace_set.workloads.get(solution.definition, [])
 
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
+
+    print(f"Found {len(workloads)} workloads for {solution.definition}")
 
     bench_trace_set = TraceSet(
         root=trace_set.root,
@@ -56,6 +63,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     result_trace_set = benchmark.run_all(dump_traces=True)
 
     traces = result_trace_set.traces.get(definition.name, [])
+    print(f"Got {len(traces)} traces from benchmark")
     results = {definition.name: {}}
 
     for trace in traces:
@@ -72,6 +80,8 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
                 entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
                 entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
             results[definition.name][trace.workload.uuid] = entry
+        else:
+            print(f"Warning: Trace for workload {trace.workload.uuid} has no evaluation")
 
     return results
 
@@ -80,6 +90,9 @@ def print_results(results: dict):
     """Print benchmark results in a formatted way."""
     for def_name, traces in results.items():
         print(f"\n{def_name}:")
+        if not traces:
+            print("  No results found!")
+            return
         for workload_uuid, result in traces.items():
             status = result.get("status")
             print(f"  Workload {workload_uuid[:8]}...: {status}", end="")
@@ -108,14 +121,22 @@ def main():
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     print("\nRunning benchmark...")
-    results = run_benchmark(solution)
+    try:
+        results = run_benchmark(solution)
 
-    if not results:
-        print("No results returned!")
-        return
+        if not results:
+            print("No results returned!")
+            return
 
-    print_results(results)
+        print_results(results)
+    except Exception as e:
+        print(f"Error during benchmark: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
+    # Required for multiprocessing on non-fork platforms
+    import multiprocessing
+    multiprocessing.set_start_method('spawn', force=True)
     main()
