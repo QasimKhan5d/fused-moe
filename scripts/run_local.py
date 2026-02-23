@@ -5,15 +5,41 @@ Automatically packs the solution from source files and runs benchmarks locally.
 """
 
 import os
+import statistics
 import sys
 from pathlib import Path
+
+import torch
 
 # Add project root to path for imports
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from flashinfer.testing import bench_gpu_time_with_cupti
 from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 from scripts.pack_solution import pack_solution
+
+# Workaround for https://github.com/flashinfer-ai/flashinfer-bench/issues/195
+# The library's do_bench() calls torch.cuda.synchronize() per-iteration inside
+# the benchmark loop, inflating runtimes for fast kernels. Replace with CUPTI.
+import flashinfer_bench.bench.timing as _timing
+
+
+def _patched_time_runnable(fn, args, warmup, iters, device):
+    lock = _timing._device_lock(device)
+    with lock:
+        with torch.cuda.device(device):
+            times = bench_gpu_time_with_cupti(
+                fn=fn,
+                dry_run_iters=warmup,
+                repeat_iters=iters,
+                input_args=tuple(args),
+                cold_l2_cache=True,
+            )
+            return statistics.median(times)
+
+
+_timing.time_runnable = _patched_time_runnable
 
 
 def get_trace_set_path() -> str:

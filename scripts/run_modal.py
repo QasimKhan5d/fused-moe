@@ -10,6 +10,7 @@ Setup (one-time):
     modal volume put flashinfer-trace /path/to/flashinfer-trace/
 """
 
+import math
 import sys
 from pathlib import Path
 
@@ -32,7 +33,7 @@ image = (
         "git", "build-essential", "cmake",
         "zlib1g-dev", "libxml2-dev",  # Required for LLVM/TLX build
     )
-    .pip_install("flashinfer-bench", "torch", "numpy")
+    .pip_install("flashinfer-bench", "flashinfer-python>=0.6.4", "torch", "numpy")
     # Install TLX-enabled Triton from Facebook's experimental repo
     .run_commands(
         "git clone https://github.com/facebookexperimental/triton.git /tmp/triton",
@@ -56,6 +57,31 @@ def run_benchmark(
         profile: If True, run torch.profiler on a representative workload
                  and include profiling data in the results.
     """
+    # Workaround for https://github.com/flashinfer-ai/flashinfer-bench/issues/195
+    # The library's do_bench() calls torch.cuda.synchronize() per-iteration inside
+    # the benchmark loop, inflating runtimes for fast kernels. Replace with CUPTI.
+    import statistics
+
+    import torch
+    from flashinfer.testing import bench_gpu_time_with_cupti
+
+    import flashinfer_bench.bench.timing as _timing
+
+    def _patched_time_runnable(fn, args, warmup, iters, device):
+        lock = _timing._device_lock(device)
+        with lock:
+            with torch.cuda.device(device):
+                times = bench_gpu_time_with_cupti(
+                    fn=fn,
+                    dry_run_iters=warmup,
+                    repeat_iters=iters,
+                    input_args=tuple(args),
+                    cold_l2_cache=True,
+                )
+                return statistics.median(times)
+
+    _timing.time_runnable = _patched_time_runnable
+
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
@@ -131,30 +157,53 @@ def _profile_solution(
     from flashinfer_bench.compile import BuilderRegistry
     from flashinfer_bench.bench.utils import gen_inputs, load_safetensors
 
+    def _workload_size_hint(workload) -> float:
+        """Best-effort numeric size for choosing a representative workload."""
+        workload_obj = getattr(workload, "workload", workload)
+        axes = getattr(workload_obj, "axes", None)
+        if isinstance(axes, dict) and axes:
+            first_val = next(iter(axes.values()))
+            if isinstance(first_val, (int, float)):
+                return float(first_val)
+
+        # Fallbacks for API variants across flashinfer-bench versions.
+        for attr in ("seq_len", "seqlen", "num_tokens", "tokens", "length"):
+            val = getattr(workload_obj, attr, None)
+            if isinstance(val, (int, float)):
+                return float(val)
+
+        return float("nan")
+
     try:
         # Build the solution into a callable
         registry = BuilderRegistry.get_instance()
         runnable = registry.build(definition, solution)
 
-        # Pick the median workload (by variable axis size) for representative profiling
+        # Pick a representative workload near the median size.
         if len(workloads) >= 3:
-            # Sort by the first variable axis value as proxy for workload size
-            sorted_wl = sorted(
-                workloads,
-                key=lambda w: list(w.axes.values())[0] if w.axes else 0,
-            )
-            workload = sorted_wl[len(sorted_wl) // 2]
+            hinted = [(i, _workload_size_hint(w)) for i, w in enumerate(workloads)]
+            valid = [(i, s) for i, s in hinted if math.isfinite(s)]
+            if valid:
+                valid.sort(key=lambda x: x[1])
+                workload = workloads[valid[len(valid) // 2][0]]
+            else:
+                # If metadata is unavailable, use median-by-index fallback.
+                workload = workloads[len(workloads) // 2]
         else:
             workload = workloads[0]
+        workload_obj = getattr(workload, "workload", workload)
 
         # Load safetensors if needed, generate inputs
         loaded_safe_tensors = (
-            load_safetensors(definition, workload, trace_set_root)
-            if any(d.type == "safetensors" for d in workload.inputs.values())
+            load_safetensors(definition, workload_obj, trace_set_root)
+            if any(
+                d.type == "safetensors"
+                for d in getattr(workload_obj, "inputs", {}).values()
+            )
             else {}
         )
         inputs = gen_inputs(
-            definition, workload, device="cuda", safe_tensors=loaded_safe_tensors
+            definition, workload_obj, device="cuda", safe_tensors=loaded_safe_tensors
         )
 
         # Warmup
@@ -257,7 +306,14 @@ def _profile_solution(
         return buf.getvalue()
 
     except Exception as e:
-        return f"[Profiling failed: {e}]"
+        # Keep output parseable by KernelEvolve's profiling extractor.
+        err = str(e).replace("\n", " ").strip()
+        return (
+            "PROFILING SUMMARY (Top Operations by CUDA Time)\n"
+            f"[Profiling failed: {err}]\n"
+            "Self CPU time total: 0.000ms\n"
+            "Self CUDA time total: 0.000ms"
+        )
 
 
 def print_results(results: dict):
