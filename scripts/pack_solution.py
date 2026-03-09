@@ -108,11 +108,16 @@ def pack_solution(output_path: Path = None) -> Path:
     sources = _collect_sources(source_dir)
 
     # Create build spec
-    spec = BuildSpec(
+    spec_kwargs = dict(
         language=language,
         target_hardware=["cuda"],
         entry_point=resolved_entry_point,
     )
+    if "binding" in build_config:
+        spec_kwargs["binding"] = build_config["binding"]
+    if "destination_passing_style" in build_config:
+        spec_kwargs["destination_passing_style"] = build_config["destination_passing_style"]
+    spec = BuildSpec(**spec_kwargs)
 
     solution = Solution(
         name=solution_config["name"],

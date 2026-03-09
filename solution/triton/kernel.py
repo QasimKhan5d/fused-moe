@@ -1,8 +1,13 @@
-"""Fused MoE - M-loop weight reuse (KSearch-inspired)."""
+"""
+Fused MoE Triton Kernel - Evolved by KernelEvolve.
+
+FlashInfer entry: kernel.py::kernel
+"""
 import torch
 import triton
 import triton.language as tl
 
+# Constants (DeepSeek-V3/R1 geometry)
 H = 7168
 I = 2048
 E_LOCAL = 32
@@ -13,19 +18,14 @@ N_GROUP = 8
 TOPK_GROUP = 4
 GROUP_SIZE = E_GLOBAL // N_GROUP
 
-# EVOLVE-BLOCK-START
-# <NAME>mloop_weight_reuse_v1</NAME>
-# EDITABLE-IMPORTS
-
+# <NAME>lock_best_configuration_geomean_optimized</NAME>
 import torch
 import triton
 import triton.language as tl
 from torch.nn import functional as F
 
-
 def evolve_precision_overrides():
     torch.set_float32_matmul_precision('high')
-
 
 @triton.jit
 def dispatch_count_kernel(
@@ -44,7 +44,6 @@ def dispatch_count_kernel(
     is_local = (expert_global >= local_start) & (expert_global < (local_start + num_local_experts))
     expert_local = expert_global - local_start
     tl.atomic_add(Counts_ptr + expert_local, 1, mask=mask & is_local)
-
 
 @triton.jit
 def dispatch_scatter_kernel(
@@ -77,6 +76,26 @@ def dispatch_scatter_kernel(
     tl.store(SortedTokenIds_ptr + dest_idx, token_id, mask=mask & is_local)
     tl.store(SortedWeights_ptr + dest_idx, weight, mask=mask & is_local)
 
+@triton.jit
+def _scan_add(a, b):
+    return a + b
+
+@triton.jit
+def scan_and_zero_kernel(
+    Counts_ptr,
+    Offsets_ptr,
+    num_items,
+    BLOCK: tl.constexpr
+):
+    offs = tl.arange(0, BLOCK)
+    mask = offs < num_items
+
+    c = tl.load(Counts_ptr + offs, mask=mask, other=0)
+    acc = tl.associative_scan(c, 0, _scan_add)
+
+    tl.store(Offsets_ptr + 1 + offs, acc, mask=mask)
+    tl.store(Offsets_ptr + offs, 0, mask=(offs == 0))
+    tl.store(Counts_ptr + offs, 0, mask=mask)
 
 @triton.jit
 def gemm1_mloop_kernel(
@@ -168,7 +187,6 @@ def gemm1_mloop_kernel(
         out_ptr_base = Out_ptr + token_offset[:, None] * stride_om + offs_n[None, :] * stride_on
         tl.store(out_ptr_base, out, mask=m_mask[:, None] & n_mask[None, :])
 
-
 @triton.jit
 def gemm2_mloop_kernel(
     C_ptr, Offsets_ptr, Weight_ptr, Idx_ptr,
@@ -204,7 +222,6 @@ def gemm2_mloop_kernel(
         gating_w = tl.load(Weight_ptr + token_offset, mask=m_mask, other=0.0)
 
         c_ptr_base = C_ptr + token_offset[:, None] * stride_cm
-
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
         for k in range(0, K, BLOCK_K):
@@ -238,16 +255,15 @@ def gemm2_mloop_kernel(
         out_ptrs = Out_ptr + orig_idx[:, None] * stride_om + offs_n[None, :] * stride_on
         tl.atomic_add(out_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
 
+_graph_cache = {}
+_workspace_cache = {}
 
 @torch.no_grad()
-def route_topk(
-    routing_logits: torch.Tensor,
-    routing_bias: torch.Tensor,
-    routed_scaling_factor: float,
-):
-    T = routing_logits.shape[0]
-    logits = routing_logits.to(torch.float32)
-    bias = routing_bias.to(torch.float32).reshape(-1)
+def _route_topk_impl(logits: torch.Tensor, bias: torch.Tensor, routed_scale: torch.Tensor):
+    T = logits.shape[0]
+    logits = logits.to(torch.float32)
+    bias = bias.to(torch.float32).reshape(-1)
+
     s = torch.sigmoid(logits)
     s_with_bias = s + bias
 
@@ -270,8 +286,41 @@ def route_topk(
     topk_idx = topk_group * GROUP_SIZE + in_group
 
     topk_s = torch.gather(s, 1, topk_idx)
-    return topk_s, topk_idx
+    assign_w = topk_s * (routed_scale / (topk_s.sum(dim=1, keepdim=True) + 1e-20))
+    return assign_w, topk_idx
 
+@torch.no_grad()
+def route_topk(
+    routing_logits: torch.Tensor,
+    routing_bias: torch.Tensor,
+    routed_scaling_factor: float,
+):
+    T = routing_logits.shape[0]
+    key = (T, routing_logits.device, routing_logits.dtype, routing_bias.dtype)
+
+    if key not in _graph_cache:
+        static_logits = routing_logits.detach().clone()
+        static_bias = routing_bias.detach().clone()
+        static_scale = torch.tensor(float(routed_scaling_factor), device=routing_logits.device, dtype=torch.float32)
+
+        w_warm, idx_warm = _route_topk_impl(static_logits, static_bias, static_scale)
+        static_w = w_warm.clone()
+        static_idx = idx_warm.clone()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            w_out, idx_out = _route_topk_impl(static_logits, static_bias, static_scale)
+            static_w.copy_(w_out)
+            static_idx.copy_(idx_out)
+
+        _graph_cache[key] = (g, static_logits, static_bias, static_scale, static_w, static_idx)
+
+    g, static_logits, static_bias, static_scale, static_w, static_idx = _graph_cache[key]
+    static_logits.copy_(routing_logits)
+    static_bias.copy_(routing_bias)
+    static_scale.fill_(float(routed_scaling_factor))
+    g.replay()
+    return static_w, static_idx
 
 @torch.no_grad()
 def custom_kernel(
@@ -296,59 +345,91 @@ def custom_kernel(
     K2 = int(gemm2_weights.shape[2])
     H = N1 // 2
 
-    topk_s, topk_idx = route_topk(routing_logits, routing_bias, routed_scaling_factor)
+    assign_w, topk_idx = route_topk(routing_logits, routing_bias, routed_scaling_factor)
     TOP_K_val = topk_idx.shape[1]
-
-    weights_sum = topk_s.sum(dim=1, keepdim=True) + 1e-20
-    assign_w = (topk_s / weights_sum) * routed_scaling_factor
+    num_assignments = T * TOP_K_val
 
     num_local_experts = num_experts
     local_start = int(local_expert_offset)
 
-    counts = torch.zeros(num_local_experts, device=device, dtype=torch.int32)
-    num_assignments = T * TOP_K_val
+    ws_key = (device, T, num_assignments, num_local_experts, H, N2)
+    if ws_key not in _workspace_cache:
+        _workspace_cache[ws_key] = (
+            torch.empty(num_local_experts, device=device, dtype=torch.int32),
+            torch.empty(num_local_experts + 1, device=device, dtype=torch.int32),
+            torch.empty(num_assignments, device=device, dtype=torch.int32),
+            torch.empty(num_assignments, device=device, dtype=torch.float32),
+            torch.empty((num_assignments, H), device=device, dtype=torch.float32),
+            torch.empty((T, N2), device=device, dtype=torch.float32),
+        )
 
-    BLOCK_DISPATCH = 1024
-    grid_dispatch = (triton.cdiv(num_assignments, BLOCK_DISPATCH),)
+    counts, offsets, sorted_token_ids, sorted_weights, C_act, out_fp32 = _workspace_cache[ws_key]
+    counts.zero_()
+    out_fp32.zero_()
 
     topk_idx = topk_idx.contiguous()
     assign_w = assign_w.contiguous()
 
+    BLOCK_DISPATCH = 1024
+    grid_dispatch = (triton.cdiv(num_assignments, BLOCK_DISPATCH),)
     dispatch_count_kernel[grid_dispatch](
         topk_idx, counts,
         num_assignments, local_start, num_local_experts,
         1,
-        BLOCK=BLOCK_DISPATCH
+        BLOCK=BLOCK_DISPATCH,
+        num_warps=2, num_stages=2,
     )
 
-    offsets = torch.zeros(num_local_experts + 1, device=device, dtype=torch.int32)
-    torch.cumsum(counts, 0, out=offsets[1:])
+    scan_and_zero_kernel[(1,)](
+        counts, offsets,
+        num_local_experts,
+        BLOCK=1024
+    )
+    current_cnts = counts
 
-    sorted_token_ids = torch.empty(num_assignments, device=device, dtype=torch.int32)
-    sorted_weights = torch.empty(num_assignments, device=device, dtype=torch.float32)
-    current_cnts = torch.zeros(num_local_experts, device=device, dtype=torch.int32)
+    if num_assignments < 4096:
+        BLOCK_DISPATCH_SCATTER = 128
+        scatter_warps = 4
+        scatter_stages = 1
+    else:
+        BLOCK_DISPATCH_SCATTER = 1024
+        scatter_warps = 2
+        scatter_stages = 2
 
-    dispatch_scatter_kernel[grid_dispatch](
+    grid_dispatch_scatter = (triton.cdiv(num_assignments, BLOCK_DISPATCH_SCATTER),)
+    dispatch_scatter_kernel[grid_dispatch_scatter](
         topk_idx, assign_w,
         offsets, current_cnts,
         sorted_token_ids, sorted_weights,
         num_assignments, TOP_K_val,
         local_start, num_local_experts,
         1, 1,
-        BLOCK=BLOCK_DISPATCH
+        BLOCK=BLOCK_DISPATCH_SCATTER,
+        num_warps=scatter_warps, num_stages=scatter_stages,
     )
 
-    BLOCK_M1 = 32
+    if num_assignments >= 16384:
+        BLOCK_M1 = 64
+        BLOCK_M2 = 64
+        gemm1_stages = 3
+        gemm2_stages = 3
+    elif num_assignments >= 4096:
+        BLOCK_M1 = 64
+        BLOCK_M2 = 64
+        gemm1_stages = 3
+        gemm2_stages = 3
+    else:
+        BLOCK_M1 = 16
+        BLOCK_M2 = 16
+        gemm1_stages = 2
+        gemm2_stages = 2
+
     BLOCK_N1 = 64
     BLOCK_K1 = 128
-    BLOCK_M2 = 32
-    BLOCK_N2 = 128
-    BLOCK_K2 = 128
-
-    C_act = torch.empty((num_assignments, H), device=device, dtype=torch.float32)
+    BLOCK_N2 = 64
+    BLOCK_K2 = 64
 
     grid_1 = (triton.cdiv(H, BLOCK_N1), num_experts)
-
     gemm1_mloop_kernel[grid_1](
         hidden_states, hidden_states_scale, sorted_token_ids, offsets,
         gemm1_weights, gemm1_weights_scale,
@@ -360,13 +441,10 @@ def custom_kernel(
         gemm1_weights_scale.stride(0), gemm1_weights_scale.stride(1), gemm1_weights_scale.stride(2),
         C_act.stride(0), C_act.stride(1),
         BLOCK_M=BLOCK_M1, BLOCK_N=BLOCK_N1, BLOCK_K=BLOCK_K1,
-        num_warps=4, num_stages=3,
+        num_warps=4, num_stages=gemm1_stages,
     )
 
-    out_fp32 = torch.zeros((T, N2), dtype=torch.float32, device=device)
-
     grid_2 = (triton.cdiv(N2, BLOCK_N2), num_experts)
-
     gemm2_mloop_kernel[grid_2](
         C_act, offsets, sorted_weights, sorted_token_ids,
         gemm2_weights, gemm2_weights_scale,
@@ -377,11 +455,11 @@ def custom_kernel(
         gemm2_weights_scale.stride(0), gemm2_weights_scale.stride(1), gemm2_weights_scale.stride(2),
         out_fp32.stride(0), out_fp32.stride(1),
         BLOCK_M=BLOCK_M2, BLOCK_N=BLOCK_N2, BLOCK_K=BLOCK_K2,
-        num_warps=4, num_stages=3,
+        num_warps=4, num_stages=gemm2_stages,
     )
 
     return out_fp32.to(torch.bfloat16)
-# EVOLVE-BLOCK-END
 
+# FlashInfer entry point
 kernel = custom_kernel
 run = custom_kernel
