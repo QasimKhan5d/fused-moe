@@ -18,14 +18,18 @@ N_GROUP = 8
 TOPK_GROUP = 4
 GROUP_SIZE = E_GLOBAL // N_GROUP
 
-# <NAME>lock_best_configuration_geomean_optimized</NAME>
+# <NAME>increase_small_regime_stages_to_3</NAME>
+# EDITABLE-IMPORTS
+
 import torch
 import triton
 import triton.language as tl
 from torch.nn import functional as F
 
+
 def evolve_precision_overrides():
     torch.set_float32_matmul_precision('high')
+
 
 @triton.jit
 def dispatch_count_kernel(
@@ -44,6 +48,7 @@ def dispatch_count_kernel(
     is_local = (expert_global >= local_start) & (expert_global < (local_start + num_local_experts))
     expert_local = expert_global - local_start
     tl.atomic_add(Counts_ptr + expert_local, 1, mask=mask & is_local)
+
 
 @triton.jit
 def dispatch_scatter_kernel(
@@ -76,9 +81,11 @@ def dispatch_scatter_kernel(
     tl.store(SortedTokenIds_ptr + dest_idx, token_id, mask=mask & is_local)
     tl.store(SortedWeights_ptr + dest_idx, weight, mask=mask & is_local)
 
+
 @triton.jit
 def _scan_add(a, b):
     return a + b
+
 
 @triton.jit
 def scan_and_zero_kernel(
@@ -96,6 +103,7 @@ def scan_and_zero_kernel(
     tl.store(Offsets_ptr + 1 + offs, acc, mask=mask)
     tl.store(Offsets_ptr + offs, 0, mask=(offs == 0))
     tl.store(Counts_ptr + offs, 0, mask=mask)
+
 
 @triton.jit
 def gemm1_mloop_kernel(
@@ -187,6 +195,7 @@ def gemm1_mloop_kernel(
         out_ptr_base = Out_ptr + token_offset[:, None] * stride_om + offs_n[None, :] * stride_on
         tl.store(out_ptr_base, out, mask=m_mask[:, None] & n_mask[None, :])
 
+
 @triton.jit
 def gemm2_mloop_kernel(
     C_ptr, Offsets_ptr, Weight_ptr, Idx_ptr,
@@ -255,11 +264,24 @@ def gemm2_mloop_kernel(
         out_ptrs = Out_ptr + orig_idx[:, None] * stride_om + offs_n[None, :] * stride_on
         tl.atomic_add(out_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
 
+
 _graph_cache = {}
 _workspace_cache = {}
 
+
+def _exclusive_cumsum_zero_triton(counts: torch.Tensor, offsets: torch.Tensor, num_items: int):
+    # Action: replace_cumsum_with_triton_scan
+    block = min(1024, triton.next_power_of_2(max(1, int(num_items))))
+    scan_and_zero_kernel[(1,)](
+        counts, offsets,
+        num_items,
+        BLOCK=block,
+        num_warps=4, num_stages=3,
+    )
+
+
 @torch.no_grad()
-def _route_topk_impl(logits: torch.Tensor, bias: torch.Tensor, routed_scale: torch.Tensor):
+def _route_topk_impl(logits: torch.Tensor, bias: torch.Tensor):
     T = logits.shape[0]
     logits = logits.to(torch.float32)
     bias = bias.to(torch.float32).reshape(-1)
@@ -286,8 +308,8 @@ def _route_topk_impl(logits: torch.Tensor, bias: torch.Tensor, routed_scale: tor
     topk_idx = topk_group * GROUP_SIZE + in_group
 
     topk_s = torch.gather(s, 1, topk_idx)
-    assign_w = topk_s * (routed_scale / (topk_s.sum(dim=1, keepdim=True) + 1e-20))
-    return assign_w, topk_idx
+    return topk_s, topk_idx
+
 
 @torch.no_grad()
 def route_topk(
@@ -301,26 +323,25 @@ def route_topk(
     if key not in _graph_cache:
         static_logits = routing_logits.detach().clone()
         static_bias = routing_bias.detach().clone()
-        static_scale = torch.tensor(float(routed_scaling_factor), device=routing_logits.device, dtype=torch.float32)
 
-        w_warm, idx_warm = _route_topk_impl(static_logits, static_bias, static_scale)
-        static_w = w_warm.clone()
+        s_warm, idx_warm = _route_topk_impl(static_logits, static_bias)
+        static_s = s_warm.clone()
         static_idx = idx_warm.clone()
 
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            w_out, idx_out = _route_topk_impl(static_logits, static_bias, static_scale)
-            static_w.copy_(w_out)
+            s_out, idx_out = _route_topk_impl(static_logits, static_bias)
+            static_s.copy_(s_out)
             static_idx.copy_(idx_out)
 
-        _graph_cache[key] = (g, static_logits, static_bias, static_scale, static_w, static_idx)
+        _graph_cache[key] = (g, static_logits, static_bias, static_s, static_idx)
 
-    g, static_logits, static_bias, static_scale, static_w, static_idx = _graph_cache[key]
+    g, static_logits, static_bias, static_s, static_idx = _graph_cache[key]
     static_logits.copy_(routing_logits)
     static_bias.copy_(routing_bias)
-    static_scale.fill_(float(routed_scaling_factor))
     g.replay()
-    return static_w, static_idx
+    return static_s, static_idx
+
 
 @torch.no_grad()
 def custom_kernel(
@@ -345,9 +366,11 @@ def custom_kernel(
     K2 = int(gemm2_weights.shape[2])
     H = N1 // 2
 
-    assign_w, topk_idx = route_topk(routing_logits, routing_bias, routed_scaling_factor)
+    topk_s, topk_idx = route_topk(routing_logits, routing_bias, routed_scaling_factor)
     TOP_K_val = topk_idx.shape[1]
     num_assignments = T * TOP_K_val
+
+    assign_w = topk_s * (routed_scaling_factor / (topk_s.sum(dim=1, keepdim=True) + 1e-20))
 
     num_local_experts = num_experts
     local_start = int(local_expert_offset)
@@ -380,11 +403,7 @@ def custom_kernel(
         num_warps=2, num_stages=2,
     )
 
-    scan_and_zero_kernel[(1,)](
-        counts, offsets,
-        num_local_experts,
-        BLOCK=1024
-    )
+    _exclusive_cumsum_zero_triton(counts, offsets, num_local_experts)
     current_cnts = counts
 
     if num_assignments < 4096:
@@ -414,20 +433,20 @@ def custom_kernel(
         gemm1_stages = 3
         gemm2_stages = 3
     elif num_assignments >= 4096:
-        BLOCK_M1 = 64
-        BLOCK_M2 = 64
+        BLOCK_M1 = 64  # Increased from 32
+        BLOCK_M2 = 64  # Increased from 32
         gemm1_stages = 3
         gemm2_stages = 3
     else:
         BLOCK_M1 = 16
         BLOCK_M2 = 16
-        gemm1_stages = 2
-        gemm2_stages = 2
+        gemm1_stages = 3  # Increased from 2
+        gemm2_stages = 3  # Increased from 2
 
     BLOCK_N1 = 64
     BLOCK_K1 = 128
-    BLOCK_N2 = 64
-    BLOCK_K2 = 64
+    BLOCK_N2 = 128
+    BLOCK_K2 = 128
 
     grid_1 = (triton.cdiv(H, BLOCK_N1), num_experts)
     gemm1_mloop_kernel[grid_1](
