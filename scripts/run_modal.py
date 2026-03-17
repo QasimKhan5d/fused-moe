@@ -27,16 +27,20 @@ trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True
 MOUNT_PATH = "/mnt"
 TRACE_SET_PATH = "/mnt/mlsys26-contest"
 PINNED_STACK = {
-    "flashinfer-bench": "0.1.2",
     "flashinfer-python": "0.6.4",
     "torch": "2.9.1",
     "numpy": "2.4.2",
     "triton": "3.5.1",
 }
+PINNED_FLASHINFER_BENCH_COMMIT = "0cd5b6e1ed0b5416866d6b81a8295ac2f1e22982"
 
 
 def format_pinned_stack() -> str:
-    return ", ".join(f"{name}=={version}" for name, version in PINNED_STACK.items())
+    parts = [
+        f"flashinfer-bench@{PINNED_FLASHINFER_BENCH_COMMIT[:7]}",
+        *[f"{name}=={version}" for name, version in PINNED_STACK.items()],
+    ]
+    return ", ".join(parts)
 
 image = (
     modal.Image.from_registry(
@@ -49,6 +53,7 @@ image = (
         "zlib1g-dev", "libxml2-dev",  # Required for LLVM/TLX build
     )
     .pip_install(
+        f"flashinfer-bench @ git+https://github.com/flashinfer-ai/flashinfer-bench.git@{PINNED_FLASHINFER_BENCH_COMMIT}",
         *[f"{name}=={version}" for name, version in PINNED_STACK.items()]
     )
 )
