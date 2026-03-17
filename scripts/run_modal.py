@@ -26,117 +26,115 @@ app = modal.App("flashinfer-bench")
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 MOUNT_PATH = "/mnt"
 TRACE_SET_PATH = "/mnt/mlsys26-contest"
+PINNED_STACK = {
+    "flashinfer-bench": "0.1.2",
+    "flashinfer-python": "0.6.4",
+    "torch": "2.9.1",
+    "numpy": "2.4.2",
+    "triton": "3.5.1",
+}
+
+
+def format_pinned_stack() -> str:
+    return ", ".join(f"{name}=={version}" for name, version in PINNED_STACK.items())
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.from_registry(
+        "nvidia/cuda:12.8.0-devel-ubuntu22.04",
+        add_python="3.12",
+    )
+    .entrypoint([])
     .apt_install(
         "git", "build-essential", "cmake",
         "zlib1g-dev", "libxml2-dev",  # Required for LLVM/TLX build
     )
-    .pip_install("flashinfer-bench", "flashinfer-python>=0.6.4", "torch", "numpy")
-    # Install TLX-enabled Triton from Facebook's experimental repo
-    .run_commands(
-        "git clone https://github.com/facebookexperimental/triton.git /tmp/triton",
-        "cd /tmp/triton && pip install -r python/requirements.txt",
-        "cd /tmp/triton && pip install -e . --no-build-isolation",
+    .pip_install(
+        *[f"{name}=={version}" for name, version in PINNED_STACK.items()]
     )
 )
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={MOUNT_PATH: trace_volume})
-def run_benchmark(
-    solution: Solution,
-    config: BenchmarkConfig = None,
-    profile: bool = False,
-) -> dict:
-    """Run benchmark on Modal B200 and return results.
+@app.cls(
+    image=image,
+    gpu="B200:1",
+    timeout=3600,
+    volumes={MOUNT_PATH: trace_volume},
+    scaledown_window=900,
+)
+class BenchmarkRunner:
+    @modal.enter()
+    def load_trace_set(self):
+        self.trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
-    Args:
-        solution: The solution to benchmark.
-        config: Benchmark configuration.
-        profile: If True, run torch.profiler on a representative workload
-                 and include profiling data in the results.
-    """
-    # Workaround for https://github.com/flashinfer-ai/flashinfer-bench/issues/195
-    # The library's do_bench() calls torch.cuda.synchronize() per-iteration inside
-    # the benchmark loop, inflating runtimes for fast kernels. Replace with CUPTI.
-    import statistics
+    @modal.method()
+    def run_benchmark(
+        self,
+        solution: Solution,
+        config: BenchmarkConfig = None,
+        profile: bool = False,
+        workload_uuids: tuple[str, ...] = (),
+    ) -> dict:
+        """Run benchmark on Modal B200 and return results."""
+        if config is None:
+            config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
-    import torch
-    from flashinfer.testing import bench_gpu_time_with_cupti
+        if solution.definition not in self.trace_set.definitions:
+            raise ValueError(f"Definition '{solution.definition}' not found in trace set")
 
-    import flashinfer_bench.bench.timing as _timing
+        definition = self.trace_set.definitions[solution.definition]
+        workloads = self.trace_set.workloads.get(solution.definition, [])
 
-    def _patched_time_runnable(fn, args, warmup, iters, device):
-        lock = _timing._device_lock(device)
-        with lock:
-            with torch.cuda.device(device):
-                times = bench_gpu_time_with_cupti(
-                    fn=fn,
-                    dry_run_iters=warmup,
-                    repeat_iters=iters,
-                    input_args=tuple(args),
-                    cold_l2_cache=True,
-                )
-                return statistics.median(times)
+        if workload_uuids:
+            selected = set(workload_uuids)
+            filtered_workloads = []
+            for workload in workloads:
+                workload_obj = getattr(workload, "workload", workload)
+                if getattr(workload_obj, "uuid", "") in selected:
+                    filtered_workloads.append(workload)
+            workloads = filtered_workloads
 
-    _timing.time_runnable = _patched_time_runnable
+        if not workloads:
+            raise ValueError(f"No workloads found for definition '{solution.definition}'")
 
-    if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
-
-    trace_set = TraceSet.from_path(TRACE_SET_PATH)
-
-    if solution.definition not in trace_set.definitions:
-        raise ValueError(f"Definition '{solution.definition}' not found in trace set")
-
-    definition = trace_set.definitions[solution.definition]
-    workloads = trace_set.workloads.get(solution.definition, [])
-
-    if not workloads:
-        raise ValueError(f"No workloads found for definition '{solution.definition}'")
-
-    bench_trace_set = TraceSet(
-        root=trace_set.root,
-        definitions={definition.name: definition},
-        solutions={definition.name: [solution]},
-        workloads={definition.name: workloads},
-        traces={definition.name: []},
-    )
-
-    benchmark = Benchmark(bench_trace_set, config)
-    result_trace_set = benchmark.run_all(dump_traces=True)
-
-    traces = result_trace_set.traces.get(definition.name, [])
-    results = {definition.name: {}}
-
-    for trace in traces:
-        if trace.evaluation:
-            entry = {
-                "status": trace.evaluation.status.value,
-                "solution": trace.solution,
-            }
-            if trace.evaluation.performance:
-                entry["latency_ms"] = trace.evaluation.performance.latency_ms
-                entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
-                entry["speedup_factor"] = trace.evaluation.performance.speedup_factor
-            if trace.evaluation.correctness:
-                entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
-                entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
-            # Capture evaluation log (stdout/stderr from the run — has tracebacks)
-            if trace.evaluation.log:
-                entry["log"] = trace.evaluation.log
-            results[definition.name][trace.workload.uuid] = entry
-
-    # Optional: run torch.profiler on a representative workload
-    if profile:
-        profiling_text = _profile_solution(
-            solution, definition, workloads, trace_set.root
+        bench_trace_set = TraceSet(
+            root=self.trace_set.root,
+            definitions={definition.name: definition},
+            solutions={definition.name: [solution]},
+            workloads={definition.name: workloads},
+            traces={definition.name: []},
         )
-        if profiling_text:
-            results["__profiling__"] = profiling_text
 
-    return results
+        benchmark = Benchmark(bench_trace_set, config)
+        result_trace_set = benchmark.run_all(dump_traces=True)
+
+        traces = result_trace_set.traces.get(definition.name, [])
+        results = {definition.name: {}}
+
+        for trace in traces:
+            if trace.evaluation:
+                entry = {
+                    "status": trace.evaluation.status.value,
+                    "solution": trace.solution,
+                }
+                if trace.evaluation.performance:
+                    entry["latency_ms"] = trace.evaluation.performance.latency_ms
+                    entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
+                    entry["speedup_factor"] = trace.evaluation.performance.speedup_factor
+                if trace.evaluation.correctness:
+                    entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
+                    entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
+                if trace.evaluation.log:
+                    entry["log"] = trace.evaluation.log
+                results[definition.name][trace.workload.uuid] = entry
+
+        if profile:
+            profiling_text = _profile_solution(
+                solution, definition, workloads, self.trace_set.root
+            )
+            if profiling_text:
+                results["__profiling__"] = profiling_text
+
+        return results
 
 
 def _profile_solution(
@@ -377,11 +375,12 @@ def print_results(results: dict):
 
 
 @app.local_entrypoint()
-def main(profile: bool = False):
+def main(profile: bool = False, workload_uuids: str = ""):
     """Pack solution and run benchmark on Modal.
     
     Args:
         profile: Run torch.profiler on a representative workload (adds ~5s).
+        workload_uuids: Comma-separated workload UUIDs to benchmark.
     """
     from scripts.pack_solution import pack_solution
 
@@ -393,9 +392,21 @@ def main(profile: bool = False):
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     print("\nRunning benchmark on Modal B200...")
+    print(f"Using pinned Modal stack: {format_pinned_stack()}")
+    print("Benchmark container stays warm between runs for reproducibility and lower startup overhead.")
     if profile:
         print("  (profiling enabled)")
-    results = run_benchmark.remote(solution, profile=profile)
+    selected_workloads = tuple(
+        uuid.strip() for uuid in workload_uuids.split(",") if uuid.strip()
+    )
+    if selected_workloads:
+        print(f"  (filtering to {len(selected_workloads)} workloads)")
+    runner = BenchmarkRunner()
+    results = runner.run_benchmark.remote(
+        solution,
+        profile=profile,
+        workload_uuids=selected_workloads,
+    )
 
     if not results:
         print("No results returned!")

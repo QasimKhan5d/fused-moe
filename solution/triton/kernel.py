@@ -22,7 +22,6 @@ GROUP_SIZE = E_GLOBAL // N_GROUP
 import torch
 import triton
 import triton.language as tl
-from torch.nn import functional as F
 
 
 def evolve_precision_overrides():
@@ -112,6 +111,7 @@ def gemm1_mloop_kernel(
     stride_am, stride_ak, stride_asm, stride_ask,
     stride_we, stride_wn, stride_wk, stride_wse, stride_wsn, stride_wsk,
     stride_om, stride_on,
+    USE_BF16_DOT: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
@@ -183,13 +183,18 @@ def gemm1_mloop_kernel(
                 other=1.0,
             )
 
-            p_gate = tl.dot(a, w_gate, allow_tf32=True)
-            p_up = tl.dot(a, w_up, allow_tf32=True)
+            if USE_BF16_DOT:
+                p_gate = tl.dot(a.to(tl.bfloat16), w_gate.to(tl.bfloat16))
+                p_up = tl.dot(a.to(tl.bfloat16), w_up.to(tl.bfloat16))
+            else:
+                p_gate = tl.dot(a, w_gate, allow_tf32=True)
+                p_up = tl.dot(a, w_up, allow_tf32=True)
 
             acc_gate += p_gate * sa * sw_gate
             acc_up += p_up * sa * sw_up
 
-        out = acc_gate * (acc_up * tl.sigmoid(acc_up))
+        acc_up = acc_up * tl.sigmoid(acc_up)
+        out = acc_gate * acc_up
         out_ptr_base = Out_ptr + token_offset[:, None] * stride_om + offs_n[None, :] * stride_on
         tl.store(out_ptr_base, out, mask=m_mask[:, None] & n_mask[None, :])
 
@@ -203,6 +208,7 @@ def gemm2_mloop_kernel(
     stride_cm, stride_ck,
     stride_we, stride_wn, stride_wk, stride_wse, stride_wsn, stride_wsk,
     stride_om, stride_on,
+    USE_TF32: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
@@ -255,182 +261,15 @@ def gemm2_mloop_kernel(
             )
 
             w_dequant = w_tile.to(tl.float32) * sw
-            acc += tl.dot(c, w_dequant, allow_tf32=True)
+            if USE_TF32:
+                acc += tl.dot(c, w_dequant, allow_tf32=True)
+            else:
+                acc += tl.dot(c, w_dequant, allow_tf32=False)
 
         acc = acc * gating_w[:, None]
         orig_idx = tl.load(Idx_ptr + token_offset, mask=m_mask, other=0)
         out_ptrs = Out_ptr + orig_idx[:, None] * stride_om + offs_n[None, :] * stride_on
         tl.atomic_add(out_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
-
-
-@triton.jit
-def gemm1_persistent_mloop_kernel(
-    A_ptr, A_scale_ptr, Idx_ptr, Offsets_ptr,
-    W_ptr, W_scale_ptr,
-    Out_ptr,
-    H, K, NUM_EXPERTS,
-    stride_am, stride_ak, stride_asm, stride_ask,
-    stride_we, stride_wn, stride_wk, stride_wse, stride_wsn, stride_wsk,
-    stride_om, stride_on,
-    NUM_SMS: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    num_n_tiles = tl.cdiv(H, BLOCK_N)
-    total_work = num_n_tiles * NUM_EXPERTS
-
-    for work_id in tl.range(pid, total_work, NUM_SMS, flatten=True):
-        pid_n = work_id % num_n_tiles
-        eid = work_id // num_n_tiles
-
-        off_start = tl.load(Offsets_ptr + eid)
-        off_end = tl.load(Offsets_ptr + eid + 1)
-        count = off_end - off_start
-
-        if count != 0:
-            offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-            offs_k = tl.arange(0, BLOCK_K)
-            n_mask = offs_n < H
-
-            w_ptr_base = W_ptr + eid * stride_we
-            ws_ptr_base = W_scale_ptr + eid * stride_wse
-
-            for m_base in range(0, count, BLOCK_M):
-                offs_m = m_base + tl.arange(0, BLOCK_M)
-                m_mask = offs_m < count
-
-                token_offset = off_start + offs_m
-                idx = tl.load(Idx_ptr + token_offset, mask=m_mask, other=0)
-
-                a_ptr_base = A_ptr + idx[:, None] * stride_am
-                a_scale_base = A_scale_ptr + idx[:, None] * stride_asm
-
-                acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-                acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-                for k in range(0, K, BLOCK_K):
-                    k_mask = (k + offs_k) < K
-
-                    a = tl.load(
-                        a_ptr_base + (k + offs_k[None, :]) * stride_ak,
-                        mask=m_mask[:, None] & k_mask[None, :],
-                        other=0.0,
-                    )
-
-                    k_blk = k // 128
-                    sa = tl.load(
-                        a_scale_base + k_blk * stride_ask,
-                        mask=m_mask[:, None],
-                        other=1.0,
-                    )
-
-                    w_gate = tl.load(
-                        w_ptr_base + offs_n[None, :] * stride_wn + (k + offs_k[:, None]) * stride_wk,
-                        mask=n_mask[None, :] & k_mask[:, None],
-                        other=0.0,
-                        eviction_policy='evict_last',
-                    )
-                    w_up = tl.load(
-                        w_ptr_base + (offs_n[None, :] + H) * stride_wn + (k + offs_k[:, None]) * stride_wk,
-                        mask=n_mask[None, :] & k_mask[:, None],
-                        other=0.0,
-                        eviction_policy='evict_last',
-                    )
-
-                    sw_gate = tl.load(
-                        ws_ptr_base + (offs_n[None, :] // 128) * stride_wsn + k_blk * stride_wsk,
-                        mask=n_mask[None, :],
-                        other=1.0,
-                    )
-                    sw_up = tl.load(
-                        ws_ptr_base + ((offs_n[None, :] + H) // 128) * stride_wsn + k_blk * stride_wsk,
-                        mask=n_mask[None, :],
-                        other=1.0,
-                    )
-
-                    p_gate = tl.dot(a, w_gate, allow_tf32=True)
-                    p_up = tl.dot(a, w_up, allow_tf32=True)
-
-                    acc_gate += p_gate * sa * sw_gate
-                    acc_up += p_up * sa * sw_up
-
-                out = acc_gate * (acc_up * tl.sigmoid(acc_up))
-                out_ptr_base = Out_ptr + token_offset[:, None] * stride_om + offs_n[None, :] * stride_on
-                tl.store(out_ptr_base, out, mask=m_mask[:, None] & n_mask[None, :])
-
-
-@triton.jit
-def gemm2_persistent_mloop_kernel(
-    C_ptr, Offsets_ptr, Weight_ptr, Idx_ptr,
-    W_ptr, W_scale_ptr,
-    Out_ptr,
-    N, K, NUM_EXPERTS,
-    stride_cm, stride_ck,
-    stride_we, stride_wn, stride_wk, stride_wse, stride_wsn, stride_wsk,
-    stride_om, stride_on,
-    NUM_SMS: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    num_n_tiles = tl.cdiv(N, BLOCK_N)
-    total_work = num_n_tiles * NUM_EXPERTS
-
-    for work_id in tl.range(pid, total_work, NUM_SMS, flatten=True):
-        pid_n = work_id % num_n_tiles
-        eid = work_id // num_n_tiles
-
-        off_start = tl.load(Offsets_ptr + eid)
-        off_end = tl.load(Offsets_ptr + eid + 1)
-        count = off_end - off_start
-
-        if count != 0:
-            offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-            offs_k = tl.arange(0, BLOCK_K)
-            n_mask = offs_n < N
-
-            w_ptr_base = W_ptr + eid * stride_we
-            ws_ptr_base = W_scale_ptr + eid * stride_wse
-
-            for m_base in range(0, count, BLOCK_M):
-                offs_m = m_base + tl.arange(0, BLOCK_M)
-                m_mask = offs_m < count
-
-                token_offset = off_start + offs_m
-                gating_w = tl.load(Weight_ptr + token_offset, mask=m_mask, other=0.0)
-
-                c_ptr_base = C_ptr + token_offset[:, None] * stride_cm
-                acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-                for k in range(0, K, BLOCK_K):
-                    k_mask = (k + offs_k) < K
-
-                    c = tl.load(
-                        c_ptr_base + (k + offs_k[None, :]) * stride_ck,
-                        mask=m_mask[:, None] & k_mask[None, :],
-                        other=0.0,
-                    )
-
-                    w_tile = tl.load(
-                        w_ptr_base + offs_n[None, :] * stride_wn + (k + offs_k[:, None]) * stride_wk,
-                        mask=n_mask[None, :] & k_mask[:, None],
-                        other=0.0,
-                        eviction_policy='evict_last',
-                    )
-
-                    k_blk = k // 128
-                    sw = tl.load(
-                        ws_ptr_base + (offs_n[None, :] // 128) * stride_wsn + k_blk * stride_wsk,
-                        mask=n_mask[None, :],
-                        other=1.0,
-                    )
-
-                    w_dequant = w_tile.to(tl.float32) * sw
-                    acc += tl.dot(c, w_dequant, allow_tf32=True)
-
-                acc = acc * gating_w[:, None]
-                orig_idx = tl.load(Idx_ptr + token_offset, mask=m_mask, other=0)
-                out_ptrs = Out_ptr + orig_idx[:, None] * stride_om + offs_n[None, :] * stride_on
-                tl.atomic_add(out_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
 
 
 @triton.jit
@@ -451,14 +290,6 @@ def finalize_cast_zero_kernel(
 
 _graph_cache = {}
 _workspace_cache = {}
-_device_sms_cache = {}
-
-
-def _get_num_sms(device: torch.device) -> int:
-    key = (device.type, device.index)
-    if key not in _device_sms_cache:
-        _device_sms_cache[key] = torch.cuda.get_device_properties(device).multi_processor_count
-    return _device_sms_cache[key]
 
 
 def _exclusive_cumsum_zero_triton(counts: torch.Tensor, offsets: torch.Tensor, num_items: int):
@@ -557,6 +388,9 @@ def custom_kernel(
 ) -> torch.Tensor:
     T = routing_logits.shape[0]
     device = hidden_states.device
+    is_small_regime = T <= 80
+    is_medium_large_regime = T >= 901 and T < 10000
+    is_huge_regime = T >= 10000
 
     num_experts = int(gemm1_weights.shape[0])
     N1 = int(gemm1_weights.shape[1])
@@ -601,7 +435,7 @@ def custom_kernel(
         num_assignments, local_start, num_local_experts,
         1,
         BLOCK=BLOCK_DISPATCH,
-        num_warps=2, num_stages=2,
+        num_warps=2, num_stages=1 if (is_medium_large_regime or is_huge_regime) else 2,
     )
 
     _exclusive_cumsum_zero_triton(counts, offsets, num_local_experts)
@@ -639,10 +473,12 @@ def custom_kernel(
         gemm1_stages = 3
         gemm2_stages = 3
 
+    use_precise_fp8_gemm1 = is_medium_large_regime or is_huge_regime
+    gemm1_warps = 4
     BLOCK_N1 = 64
     BLOCK_K1 = 128
-    BLOCK_N2 = 128
-    BLOCK_K2 = 128
+    BLOCK_K2 = 64
+    BLOCK_N2 = 64
 
     grid_1 = (triton.cdiv(H, BLOCK_N1), num_experts)
     gemm1_mloop_kernel[grid_1](
@@ -655,11 +491,12 @@ def custom_kernel(
         gemm1_weights.stride(0), gemm1_weights.stride(1), gemm1_weights.stride(2),
         gemm1_weights_scale.stride(0), gemm1_weights_scale.stride(1), gemm1_weights_scale.stride(2),
         C_act.stride(0), C_act.stride(1),
+        USE_BF16_DOT=use_precise_fp8_gemm1,
         BLOCK_M=BLOCK_M1, BLOCK_N=BLOCK_N1, BLOCK_K=BLOCK_K1,
-        num_warps=4, num_stages=gemm1_stages,
+        num_warps=gemm1_warps, num_stages=gemm1_stages,
     )
 
-    if num_assignments >= 16384:
+    if is_huge_regime:
         gemm2_warps = 8
     else:
         gemm2_warps = 4
@@ -674,21 +511,24 @@ def custom_kernel(
         gemm2_weights.stride(0), gemm2_weights.stride(1), gemm2_weights.stride(2),
         gemm2_weights_scale.stride(0), gemm2_weights_scale.stride(1), gemm2_weights_scale.stride(2),
         out_fp32.stride(0), out_fp32.stride(1),
+        USE_TF32=True,
         BLOCK_M=BLOCK_M2, BLOCK_N=BLOCK_N2, BLOCK_K=BLOCK_K2,
         num_warps=gemm2_warps, num_stages=gemm2_stages,
     )
 
     numel = T * N2
-    BLOCK_FINAL = 256
+    BLOCK_FINAL = 1024 if (is_medium_large_regime or is_huge_regime) else 256
     grid_final = (triton.cdiv(numel, BLOCK_FINAL),)
     finalize_cast_zero_kernel[grid_final](
         out_fp32, out_bf16,
         numel,
         BLOCK=BLOCK_FINAL,
-        num_warps=4, num_stages=2,
+        num_warps=8 if (is_medium_large_regime or is_huge_regime) else 4,
+        num_stages=2,
     )
 
     return out_bf16
+
 # FlashInfer entry point
 kernel = custom_kernel
 run = custom_kernel
