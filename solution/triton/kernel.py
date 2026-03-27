@@ -1,6 +1,14 @@
 """
 Fused MoE Triton Kernel - Evolved by KernelEvolve.
 
+Optimizations over v6 baseline:
+  1. Removed USE_BF16_DOT — FP8 MMA for all regimes (was BF16 cast for T>=901)
+  2. Unified regime — single BLOCK_M=64 path, no per-regime branching
+  3. FP8 intermediate — C_act quantized to FP8 E4M3 with per-128-block scales
+     so GEMM2 uses FP8×FP8 tensor cores (~2x compute throughput vs FP32)
+  4. Power-of-2 scale awareness — DSV3 weight scales are exact pow2, so
+     scale multiplications introduce zero mantissa rounding error
+
 FlashInfer entry: kernel.py::kernel
 """
 import torch
@@ -102,6 +110,7 @@ def scan_and_zero_kernel(
     tl.store(Counts_ptr + offs, 0, mask=mask)
 
 
+# ---------- GEMM1: always FP8 dot, no BF16 fallback ----------
 @triton.jit
 def gemm1_mloop_kernel(
     A_ptr, A_scale_ptr, Idx_ptr, Offsets_ptr,
@@ -111,7 +120,6 @@ def gemm1_mloop_kernel(
     stride_am, stride_ak, stride_asm, stride_ask,
     stride_we, stride_wn, stride_wk, stride_wse, stride_wsn, stride_wsk,
     stride_om, stride_on,
-    USE_BF16_DOT: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
@@ -183,12 +191,10 @@ def gemm1_mloop_kernel(
                 other=1.0,
             )
 
-            if USE_BF16_DOT:
-                p_gate = tl.dot(a.to(tl.bfloat16), w_gate.to(tl.bfloat16))
-                p_up = tl.dot(a.to(tl.bfloat16), w_up.to(tl.bfloat16))
-            else:
-                p_gate = tl.dot(a, w_gate, allow_tf32=True)
-                p_up = tl.dot(a, w_up, allow_tf32=True)
+            # FP8 MMA for all regimes — no BF16 cast fallback.
+            # DSV3 weight scales are powers of 2, so scale multiply is exact.
+            p_gate = tl.dot(a, w_gate, allow_tf32=True)
+            p_up = tl.dot(a, w_up, allow_tf32=True)
 
             acc_gate += p_gate * sa * sw_gate
             acc_up += p_up * sa * sw_up
@@ -199,16 +205,53 @@ def gemm1_mloop_kernel(
         tl.store(out_ptr_base, out, mask=m_mask[:, None] & n_mask[None, :])
 
 
+# ---------- FP8 quantization for C_act intermediate ----------
 @triton.jit
-def gemm2_mloop_kernel(
-    C_ptr, Offsets_ptr, Weight_ptr, Idx_ptr,
+def quantize_fp8_kernel(
+    In_ptr,
+    Out_fp8_ptr,
+    Scale_ptr,
+    num_rows, K,
+    stride_im, stride_ik,
+    stride_om, stride_ok,
+    stride_sm, stride_sk,
+    BLOCK_Q: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_blocks = K // BLOCK_Q
+    row = pid // num_blocks
+    blk_idx = pid % num_blocks
+
+    if row >= num_rows:
+        return
+
+    offs = blk_idx * BLOCK_Q + tl.arange(0, BLOCK_Q)
+    mask = offs < K
+
+    vals = tl.load(In_ptr + row * stride_im + offs * stride_ik, mask=mask, other=0.0)
+
+    amax = tl.max(tl.abs(vals))
+    scale = amax / 448.0
+    scale = tl.where(scale > 0, scale, 1.0)
+
+    fp8_vals = (vals / scale).to(tl.float8e4nv)
+
+    tl.store(Out_fp8_ptr + row * stride_om + offs * stride_ok, fp8_vals, mask=mask)
+    tl.store(Scale_ptr + row * stride_sm + blk_idx * stride_sk, scale)
+
+
+# ---------- GEMM2: FP8×FP8 tensor cores for both C_act and weights ----------
+@triton.jit
+def gemm2_fp8_mloop_kernel(
+    C_fp8_ptr, C_scale_ptr,
+    Offsets_ptr, Weight_ptr, Idx_ptr,
     W_ptr, W_scale_ptr,
     Out_ptr,
     N, K,
     stride_cm, stride_ck,
+    stride_csm, stride_csk,
     stride_we, stride_wn, stride_wk, stride_wse, stride_wsn, stride_wsk,
     stride_om, stride_on,
-    USE_TF32: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
@@ -234,37 +277,42 @@ def gemm2_mloop_kernel(
         token_offset = off_start + offs_m
         gating_w = tl.load(Weight_ptr + token_offset, mask=m_mask, other=0.0)
 
-        c_ptr_base = C_ptr + token_offset[:, None] * stride_cm
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
         for k in range(0, K, BLOCK_K):
             k_mask = (k + offs_k) < K
 
-            c = tl.load(
-                c_ptr_base + (k + offs_k[None, :]) * stride_ck,
+            c_fp8 = tl.load(
+                C_fp8_ptr + token_offset[:, None] * stride_cm + (k + offs_k[None, :]) * stride_ck,
                 mask=m_mask[:, None] & k_mask[None, :],
                 other=0.0,
             )
 
-            w_tile = tl.load(
+            k_blk = k // 128
+            c_s = tl.load(
+                C_scale_ptr + token_offset[:, None] * stride_csm + k_blk * stride_csk,
+                mask=m_mask[:, None],
+                other=1.0,
+            )
+
+            w_fp8 = tl.load(
                 w_ptr_base + offs_n[None, :] * stride_wn + (k + offs_k[:, None]) * stride_wk,
                 mask=n_mask[None, :] & k_mask[:, None],
                 other=0.0,
                 eviction_policy='evict_last',
             )
 
-            k_blk = k // 128
-            sw = tl.load(
+            w_s = tl.load(
                 ws_ptr_base + (offs_n[None, :] // 128) * stride_wsn + k_blk * stride_wsk,
                 mask=n_mask[None, :],
                 other=1.0,
             )
 
-            w_dequant = w_tile.to(tl.float32) * sw
-            if USE_TF32:
-                acc += tl.dot(c, w_dequant, allow_tf32=True)
-            else:
-                acc += tl.dot(c, w_dequant, allow_tf32=False)
+            # FP8×FP8 MMA — both operands are E4M3, hardware tensor cores
+            # handle the FP8 multiply-accumulate into FP32 accumulator.
+            # Scales applied after: c_s is (BLOCK_M,1), w_s is (1,BLOCK_N).
+            p = tl.dot(c_fp8, w_fp8)
+            acc += p * c_s * w_s
 
         acc = acc * gating_w[:, None]
         orig_idx = tl.load(Idx_ptr + token_offset, mask=m_mask, other=0)
@@ -388,9 +436,6 @@ def custom_kernel(
 ) -> torch.Tensor:
     T = routing_logits.shape[0]
     device = hidden_states.device
-    is_small_regime = T <= 80
-    is_medium_large_regime = T >= 901 and T < 10000
-    is_huge_regime = T >= 10000
 
     num_experts = int(gemm1_weights.shape[0])
     N1 = int(gemm1_weights.shape[1])
@@ -408,6 +453,8 @@ def custom_kernel(
     num_local_experts = num_experts
     local_start = int(local_expert_offset)
 
+    num_c_blocks = H // 128
+
     ws_key = (device, T, num_assignments, num_local_experts, H, N2)
     if ws_key not in _workspace_cache:
         _workspace_cache[ws_key] = (
@@ -416,11 +463,14 @@ def custom_kernel(
             torch.empty(num_assignments, device=device, dtype=torch.int32),
             torch.empty(num_assignments, device=device, dtype=torch.float32),
             torch.empty((num_assignments, H), device=device, dtype=torch.float32),
+            torch.empty((num_assignments, H), device=device, dtype=torch.float8_e4m3fn),
+            torch.empty((num_assignments, num_c_blocks), device=device, dtype=torch.float32),
             torch.zeros((T, N2), device=device, dtype=torch.float32),
             torch.empty((T, N2), device=device, dtype=torch.bfloat16),
         )
 
-    counts, offsets, sorted_token_ids, sorted_weights, C_act, out_fp32, out_bf16 = _workspace_cache[ws_key]
+    (counts, offsets, sorted_token_ids, sorted_weights,
+     C_act, C_act_fp8, C_act_scale, out_fp32, out_bf16) = _workspace_cache[ws_key]
     counts.zero_()
 
     if not topk_idx.is_contiguous():
@@ -428,6 +478,7 @@ def custom_kernel(
     if not assign_w.is_contiguous():
         assign_w = assign_w.contiguous()
 
+    # --- Dispatch ---
     BLOCK_DISPATCH = 1024
     grid_dispatch = (triton.cdiv(num_assignments, BLOCK_DISPATCH),)
     dispatch_count_kernel[grid_dispatch](
@@ -435,21 +486,13 @@ def custom_kernel(
         num_assignments, local_start, num_local_experts,
         1,
         BLOCK=BLOCK_DISPATCH,
-        num_warps=2, num_stages=1 if (is_medium_large_regime or is_huge_regime) else 2,
+        num_warps=2, num_stages=2,
     )
 
     _exclusive_cumsum_zero_triton(counts, offsets, num_local_experts)
     current_cnts = counts
 
-    if num_assignments < 4096:
-        BLOCK_DISPATCH_SCATTER = 128
-        scatter_warps = 4
-        scatter_stages = 1
-    else:
-        BLOCK_DISPATCH_SCATTER = 1024
-        scatter_warps = 2
-        scatter_stages = 2
-
+    BLOCK_DISPATCH_SCATTER = 1024 if num_assignments >= 4096 else 128
     grid_dispatch_scatter = (triton.cdiv(num_assignments, BLOCK_DISPATCH_SCATTER),)
     dispatch_scatter_kernel[grid_dispatch_scatter](
         topk_idx, assign_w,
@@ -459,26 +502,13 @@ def custom_kernel(
         local_start, num_local_experts,
         1, 1,
         BLOCK=BLOCK_DISPATCH_SCATTER,
-        num_warps=scatter_warps, num_stages=scatter_stages,
+        num_warps=4, num_stages=2,
     )
 
-    if num_assignments >= 4096:
-        BLOCK_M1 = 64
-        BLOCK_M2 = 64
-        gemm1_stages = 3
-        gemm2_stages = 3
-    else:
-        BLOCK_M1 = 16
-        BLOCK_M2 = 16
-        gemm1_stages = 3
-        gemm2_stages = 3
-
-    use_precise_fp8_gemm1 = is_medium_large_regime or is_huge_regime
-    gemm1_warps = 4
+    # --- GEMM1: unified BLOCK_M=64, FP8 dot always ---
+    BLOCK_M = 64
     BLOCK_N1 = 64
     BLOCK_K1 = 128
-    BLOCK_K2 = 64
-    BLOCK_N2 = 64
 
     grid_1 = (triton.cdiv(H, BLOCK_N1), num_experts)
     gemm1_mloop_kernel[grid_1](
@@ -491,40 +521,53 @@ def custom_kernel(
         gemm1_weights.stride(0), gemm1_weights.stride(1), gemm1_weights.stride(2),
         gemm1_weights_scale.stride(0), gemm1_weights_scale.stride(1), gemm1_weights_scale.stride(2),
         C_act.stride(0), C_act.stride(1),
-        USE_BF16_DOT=use_precise_fp8_gemm1,
-        BLOCK_M=BLOCK_M1, BLOCK_N=BLOCK_N1, BLOCK_K=BLOCK_K1,
-        num_warps=gemm1_warps, num_stages=gemm1_stages,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N1, BLOCK_K=BLOCK_K1,
+        num_warps=4, num_stages=3,
     )
 
-    if is_huge_regime:
-        gemm2_warps = 8
-    else:
-        gemm2_warps = 4
+    # --- Quantize C_act → FP8 with per-128-block scales ---
+    total_quant_blocks = num_assignments * num_c_blocks
+    quantize_fp8_kernel[(total_quant_blocks,)](
+        C_act,
+        C_act_fp8,
+        C_act_scale,
+        num_assignments, H,
+        C_act.stride(0), C_act.stride(1),
+        C_act_fp8.stride(0), C_act_fp8.stride(1),
+        C_act_scale.stride(0), C_act_scale.stride(1),
+        BLOCK_Q=128,
+        num_warps=4, num_stages=2,
+    )
+
+    # --- GEMM2: FP8×FP8 tensor cores ---
+    BLOCK_N2 = 64
+    BLOCK_K2 = 64
 
     grid_2 = (triton.cdiv(N2, BLOCK_N2), num_experts)
-    gemm2_mloop_kernel[grid_2](
-        C_act, offsets, sorted_weights, sorted_token_ids,
+    gemm2_fp8_mloop_kernel[grid_2](
+        C_act_fp8, C_act_scale,
+        offsets, sorted_weights, sorted_token_ids,
         gemm2_weights, gemm2_weights_scale,
         out_fp32,
         N2, K2,
-        C_act.stride(0), C_act.stride(1),
+        C_act_fp8.stride(0), C_act_fp8.stride(1),
+        C_act_scale.stride(0), C_act_scale.stride(1),
         gemm2_weights.stride(0), gemm2_weights.stride(1), gemm2_weights.stride(2),
         gemm2_weights_scale.stride(0), gemm2_weights_scale.stride(1), gemm2_weights_scale.stride(2),
         out_fp32.stride(0), out_fp32.stride(1),
-        USE_TF32=True,
-        BLOCK_M=BLOCK_M2, BLOCK_N=BLOCK_N2, BLOCK_K=BLOCK_K2,
-        num_warps=gemm2_warps, num_stages=gemm2_stages,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N2, BLOCK_K=BLOCK_K2,
+        num_warps=4, num_stages=3,
     )
 
+    # --- Finalize: cast FP32 → BF16 and zero accumulator ---
     numel = T * N2
-    BLOCK_FINAL = 1024 if (is_medium_large_regime or is_huge_regime) else 256
+    BLOCK_FINAL = 1024
     grid_final = (triton.cdiv(numel, BLOCK_FINAL),)
     finalize_cast_zero_kernel[grid_final](
         out_fp32, out_bf16,
         numel,
         BLOCK=BLOCK_FINAL,
-        num_warps=8 if (is_medium_large_regime or is_huge_regime) else 4,
-        num_stages=2,
+        num_warps=8, num_stages=2,
     )
 
     return out_bf16
