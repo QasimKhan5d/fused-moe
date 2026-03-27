@@ -7,10 +7,11 @@ on NVIDIA B200 GPUs via Modal.
 Setup (one-time):
     modal setup
     modal volume create flashinfer-trace
-    modal volume put flashinfer-trace /path/to/flashinfer-trace/
+    modal volume put flashinfer-trace /path/to/mlsys26-contest/
 """
 
 import math
+import shutil
 import sys
 from pathlib import Path
 
@@ -31,36 +32,138 @@ PINNED_STACK = {
     "torch": "2.9.1",
     "numpy": "2.4.2",
     "triton": "3.5.1",
+    "cupti-python": ">=13",
+}
+NCU_PINNED_STACK = {
+    name: version
+    for name, version in PINNED_STACK.items()
+    if name != "cupti-python"
 }
 PINNED_FLASHINFER_BENCH_COMMIT = "0cd5b6e1ed0b5416866d6b81a8295ac2f1e22982"
+NCU_OUTPUT_START = "=== NCU OUTPUT START ==="
+NCU_OUTPUT_END = "=== NCU OUTPUT END ==="
 
 
 def format_pinned_stack() -> str:
-    parts = [
-        f"flashinfer-bench@{PINNED_FLASHINFER_BENCH_COMMIT[:7]}",
-        *[f"{name}=={version}" for name, version in PINNED_STACK.items()],
-    ]
+    parts = [f"flashinfer-bench@{PINNED_FLASHINFER_BENCH_COMMIT[:7]}"]
+    for name, version in PINNED_STACK.items():
+        if version.startswith((">", "<")):
+            parts.append(f"{name}{version}")
+        else:
+            parts.append(f"{name}=={version}")
     return ", ".join(parts)
 
-image = (
+benchmark_image = (
     modal.Image.from_registry(
         "nvidia/cuda:12.8.0-devel-ubuntu22.04",
         add_python="3.12",
     )
     .entrypoint([])
     .apt_install(
-        "git", "build-essential", "cmake",
+        "git", "build-essential", "cmake", "wget", "gnupg",
         "zlib1g-dev", "libxml2-dev",  # Required for LLVM/TLX build
+    )
+    .run_commands(
+        "rm -f /usr/share/keyrings/cuda-archive-keyring.gpg && wget -qO- https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/3bf863cc.pub | gpg --batch --dearmor -o /usr/share/keyrings/cuda-archive-keyring.gpg",
+        "echo 'deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/ /' > /etc/apt/sources.list.d/cuda.list",
+        "apt-get update && apt-get install -y nsight-compute-2026.1.0",
     )
     .pip_install(
         f"flashinfer-bench @ git+https://github.com/flashinfer-ai/flashinfer-bench.git@{PINNED_FLASHINFER_BENCH_COMMIT}",
-        *[f"{name}=={version}" for name, version in PINNED_STACK.items()]
+        *[
+            f"{name}{version}" if version.startswith((">", "<")) else f"{name}=={version}"
+            for name, version in PINNED_STACK.items()
+        ]
+    )
+)
+
+ncu_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install(
+        "git", "build-essential", "cmake", "wget", "gnupg",
+        "zlib1g-dev", "libxml2-dev",
+    )
+    .run_commands(
+        "wget -qO- https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/3bf863cc.pub | gpg --dearmor -o /usr/share/keyrings/cuda-archive-keyring.gpg",
+        "echo 'deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/ /' > /etc/apt/sources.list.d/cuda.list",
+        "apt-get update && apt-get install -y nsight-compute-2026.1.0",
+    )
+    .pip_install(
+        f"flashinfer-bench @ git+https://github.com/flashinfer-ai/flashinfer-bench.git@{PINNED_FLASHINFER_BENCH_COMMIT}",
+        *[
+            f"{name}{version}" if version.startswith((">", "<")) else f"{name}=={version}"
+            for name, version in NCU_PINNED_STACK.items()
+        ]
     )
 )
 
 
+def _find_ncu_binary() -> str:
+    """Return the Nsight Compute binary path inside the Modal container."""
+    ncu_path = shutil.which("ncu")
+    if ncu_path:
+        return ncu_path
+
+    candidates = sorted(Path("/opt/nvidia/nsight-compute").glob("*/ncu"))
+    if not candidates:
+        raise FileNotFoundError("Nsight Compute binary not found in Modal image")
+    return str(candidates[-1])
+
+
+def _workload_size_hint(workload) -> float:
+    """Best-effort numeric size for choosing representative workloads."""
+    workload_obj = getattr(workload, "workload", workload)
+    axes = getattr(workload_obj, "axes", None)
+    if isinstance(axes, dict) and axes:
+        first_val = next(iter(axes.values()))
+        if isinstance(first_val, (int, float)):
+            return float(first_val)
+
+    for attr in ("seq_len", "seqlen", "num_tokens", "tokens", "length"):
+        val = getattr(workload_obj, attr, None)
+        if isinstance(val, (int, float)):
+            return float(val)
+
+    return float("nan")
+
+
+def _select_workload(workloads: list, strategy: str) -> object:
+    """Choose a representative workload for profiling."""
+    if not workloads:
+        raise ValueError("No workloads available for profiling")
+
+    if len(workloads) < 3:
+        return workloads[0]
+
+    hinted = [(i, _workload_size_hint(w)) for i, w in enumerate(workloads)]
+    valid = [(i, size) for i, size in hinted if math.isfinite(size)]
+    if not valid:
+        return workloads[len(workloads) // 2]
+
+    valid.sort(key=lambda item: item[1])
+    if strategy == "largest":
+        return workloads[valid[-1][0]]
+    return workloads[valid[len(valid) // 2][0]]
+
+
+def _official_moe_config(config: BenchmarkConfig | None = None) -> BenchmarkConfig:
+    """Mirror the official MoE evaluation knobs from EVALUATION.md as closely as possible."""
+    if config is None:
+        config = BenchmarkConfig()
+
+    config.warmup_runs = 10
+    config.iterations = 50
+    config.num_trials = 3
+    config.atol = 1.0
+    config.rtol = 0.3
+    config.required_matched_ratio = 0.9
+    config.use_isolated_runner = True
+    config.timeout_seconds = 300
+    return config
+
+
 @app.cls(
-    image=image,
+    image=benchmark_image,
     gpu="B200:1",
     timeout=3600,
     volumes={MOUNT_PATH: trace_volume},
@@ -80,8 +183,7 @@ class BenchmarkRunner:
         workload_uuids: tuple[str, ...] = (),
     ) -> dict:
         """Run benchmark on Modal B200 and return results."""
-        if config is None:
-            config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        config = _official_moe_config(config)
 
         if solution.definition not in self.trace_set.definitions:
             raise ValueError(f"Definition '{solution.definition}' not found in trace set")
@@ -110,7 +212,7 @@ class BenchmarkRunner:
         )
 
         benchmark = Benchmark(bench_trace_set, config)
-        result_trace_set = benchmark.run_all(dump_traces=True)
+        result_trace_set = benchmark.run_all(dump_traces=True, resume=True)
 
         traces = result_trace_set.traces.get(definition.name, [])
         results = {definition.name: {}}
@@ -141,6 +243,43 @@ class BenchmarkRunner:
 
         return results
 
+@app.cls(
+    image=ncu_image,
+    gpu="B200:1",
+    timeout=3600,
+    volumes={MOUNT_PATH: trace_volume},
+    scaledown_window=900,
+)
+class NcuRunner:
+    @modal.enter()
+    def load_trace_set(self):
+        self.trace_set = TraceSet.from_path(TRACE_SET_PATH)
+
+    @modal.method()
+    def run_ncu(
+        self,
+        solution: Solution,
+        workload_uuids: tuple[str, ...] = (),
+    ) -> str:
+        """Run Nsight Compute on a representative workload inside Modal."""
+        if solution.definition not in self.trace_set.definitions:
+            raise ValueError(f"Definition '{solution.definition}' not found in trace set")
+
+        definition = self.trace_set.definitions[solution.definition]
+        workloads = self.trace_set.workloads.get(solution.definition, [])
+
+        if workload_uuids:
+            selected = set(workload_uuids)
+            workloads = [
+                workload
+                for workload in workloads
+                if getattr(getattr(workload, "workload", workload), "uuid", "") in selected
+            ]
+
+        if not workloads:
+            raise ValueError(f"No workloads found for definition '{solution.definition}'")
+
+        return _run_ncu_solution(solution, definition, workloads, self.trace_set.root)
 
 def _profile_solution(
     solution: Solution,
@@ -160,40 +299,13 @@ def _profile_solution(
     from flashinfer_bench.compile import BuilderRegistry
     from flashinfer_bench.bench.utils import gen_inputs, load_safetensors
 
-    def _workload_size_hint(workload) -> float:
-        """Best-effort numeric size for choosing a representative workload."""
-        workload_obj = getattr(workload, "workload", workload)
-        axes = getattr(workload_obj, "axes", None)
-        if isinstance(axes, dict) and axes:
-            first_val = next(iter(axes.values()))
-            if isinstance(first_val, (int, float)):
-                return float(first_val)
-
-        # Fallbacks for API variants across flashinfer-bench versions.
-        for attr in ("seq_len", "seqlen", "num_tokens", "tokens", "length"):
-            val = getattr(workload_obj, attr, None)
-            if isinstance(val, (int, float)):
-                return float(val)
-
-        return float("nan")
-
     try:
         # Build the solution into a callable
         registry = BuilderRegistry.get_instance()
         runnable = registry.build(definition, solution)
 
         # Pick a representative workload near the median size.
-        if len(workloads) >= 3:
-            hinted = [(i, _workload_size_hint(w)) for i, w in enumerate(workloads)]
-            valid = [(i, s) for i, s in hinted if math.isfinite(s)]
-            if valid:
-                valid.sort(key=lambda x: x[1])
-                workload = workloads[valid[len(valid) // 2][0]]
-            else:
-                # If metadata is unavailable, use median-by-index fallback.
-                workload = workloads[len(workloads) // 2]
-        else:
-            workload = workloads[0]
+        workload = _select_workload(workloads, strategy="median")
         workload_obj = getattr(workload, "workload", workload)
 
         # Load safetensors if needed, generate inputs
@@ -319,6 +431,191 @@ def _profile_solution(
         )
 
 
+def _run_ncu_solution(
+    solution: Solution,
+    definition,
+    workloads: list,
+    trace_set_root,
+) -> str:
+    """Run NCU via subprocess using the Modal-supported workflow."""
+    import glob
+    import os
+    import subprocess
+    import sys
+    import tempfile
+    import textwrap
+
+    workload = _select_workload(workloads, strategy="largest")
+    workload_obj = getattr(workload, "workload", workload)
+
+    with tempfile.TemporaryDirectory(prefix="fused-moe-ncu-") as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        solution_path = tmpdir_path / "solution.json"
+        definition_path = tmpdir_path / "definition.json"
+        workload_path = tmpdir_path / "workload.json"
+        runner_path = tmpdir_path / "run_ncu_target.py"
+
+        solution_path.write_text(solution.model_dump_json())
+        definition_path.write_text(definition.model_dump_json())
+        workload_path.write_text(workload_obj.model_dump_json())
+
+        runner_path.write_text(
+            textwrap.dedent(
+                f"""
+                import json
+                from pathlib import Path
+
+                import torch
+                from flashinfer_bench import Solution
+                from flashinfer_bench.compile import BuilderRegistry
+                from flashinfer_bench.entities.definition import Definition
+                from flashinfer_bench.entities.workload import Workload
+                from flashinfer_bench.bench.utils import gen_inputs, load_safetensors
+
+                tmpdir = Path({tmpdir!r})
+                trace_set_root = Path({str(trace_set_root)!r})
+
+                solution = Solution.model_validate_json((tmpdir / "solution.json").read_text())
+                definition = Definition.model_validate_json((tmpdir / "definition.json").read_text())
+                workload = Workload.model_validate_json((tmpdir / "workload.json").read_text())
+
+                registry = BuilderRegistry.get_instance()
+                runnable = registry.build(definition, solution)
+
+                loaded_safe_tensors = (
+                    load_safetensors(definition, workload, trace_set_root)
+                    if any(d.type == "safetensors" for d in getattr(workload, "inputs", {{}}).values())
+                    else {{}}
+                )
+                inputs = gen_inputs(
+                    definition,
+                    workload,
+                    device="cuda",
+                    safe_tensors=loaded_safe_tensors,
+                )
+
+                for _ in range(3):
+                    with torch.no_grad():
+                        _ = runnable(*inputs)
+                torch.cuda.synchronize()
+
+                with torch.no_grad():
+                    _ = runnable(*inputs)
+                torch.cuda.synchronize()
+
+                runnable.cleanup()
+                """
+            ).strip()
+            + "\n"
+        )
+
+        candidate_lib_dirs = []
+        candidate_lib_patterns = [
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/local/cuda/lib64",
+            "/usr/local/cuda/extras/CUPTI/lib64",
+        ]
+        for pattern in sys.path:
+            candidate_lib_patterns.extend(
+                [
+                    os.path.join(pattern, "nvidia", "*", "lib"),
+                    os.path.join(pattern, "nvidia", "*", "bin"),
+                    os.path.join(pattern, "torch", "lib"),
+                ]
+            )
+
+        seen_dirs = set()
+        for pattern in candidate_lib_patterns:
+            for path in glob.glob(pattern):
+                if os.path.isdir(path) and path not in seen_dirs:
+                    seen_dirs.add(path)
+                    candidate_lib_dirs.append(path)
+
+        env = os.environ.copy()
+        existing_ld_library_path = env.get("LD_LIBRARY_PATH", "")
+        ld_library_parts = candidate_lib_dirs[:]
+        if existing_ld_library_path:
+            ld_library_parts.append(existing_ld_library_path)
+        env["LD_LIBRARY_PATH"] = ":".join(ld_library_parts)
+
+        cmd = [
+            _find_ncu_binary(),
+            "--set",
+            "basic",
+            "--target-processes",
+            "all",
+            "--launch-count",
+            "1",
+            "python",
+            str(runner_path),
+        ]
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=180,
+                env=env,
+            )
+        except Exception as exc:
+            return f"ERROR: NCU profiling failed: {exc}"
+
+        parts = [
+            f"Representative workload UUID: {getattr(workload_obj, 'uuid', 'unknown')}",
+            f"NCU exit code: {proc.returncode}",
+        ]
+        if proc.stdout.strip():
+            parts.append(proc.stdout.strip())
+        if proc.stderr.strip():
+            parts.append(f"STDERR:\n{proc.stderr.strip()}")
+
+        if proc.returncode != 0:
+            diagnostics = []
+            diagnostics.append(
+                "ENVIRONMENT:\n"
+                f"LD_LIBRARY_PATH={env.get('LD_LIBRARY_PATH', '')}\n"
+                f"PATH={os.environ.get('PATH', '')}"
+            )
+            diagnostics.append(
+                "CANDIDATE_LIB_DIRS:\n" + "\n".join(candidate_lib_dirs)
+            )
+
+            for diag_cmd in (
+                ["python", "--version"],
+                ["nvidia-smi"],
+                ["bash", "-lc", "ldconfig -p | rg 'libcuda|libcupti|libnvidia' || true"],
+                ["bash", "-lc", "ls -l /usr/lib/x86_64-linux-gnu/libcuda* /usr/lib/x86_64-linux-gnu/libcupti* 2>/dev/null || true"],
+                ["bash", "-lc", "ls -l /usr/local/cuda/lib64/libcupti* 2>/dev/null || true"],
+                ["bash", "-lc", "env | rg 'CUDA|NVIDIA|LD_' || true"],
+                ["bash", "-lc", "ls -1 /tmp/nsight-compute-*.log 2>/dev/null || true"],
+                ["bash", "-lc", "for f in /tmp/nsight-compute-*.log; do [ -f \"$f\" ] && echo \"--- $f ---\" && sed -n '1,220p' \"$f\"; done"],
+            ):
+                try:
+                    diag_proc = subprocess.run(
+                        diag_cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    rendered_cmd = " ".join(diag_cmd)
+                    output = (diag_proc.stdout or "").strip()
+                    err = (diag_proc.stderr or "").strip()
+                    block = [f"$ {rendered_cmd}"]
+                    if output:
+                        block.append(output)
+                    if err:
+                        block.append(f"STDERR:\n{err}")
+                    diagnostics.append("\n".join(block))
+                except Exception as diag_exc:
+                    diagnostics.append(
+                        f"$ {' '.join(diag_cmd)}\n[diagnostic command failed: {diag_exc}]"
+                    )
+
+            parts.append("DIAGNOSTICS:\n\n" + "\n\n".join(diagnostics))
+        return "\n\n".join(parts)
+
+
 def print_results(results: dict):
     """Print benchmark results in a formatted way."""
     for def_name, traces in results.items():
@@ -379,48 +676,89 @@ def print_results(results: dict):
             print()
 
 
+def _load_solution(solution_json: str = "") -> Solution:
+    if solution_json:
+        solution_path = Path(solution_json).expanduser().resolve()
+        print(f"Loading solution from: {solution_path}")
+    else:
+        from scripts.pack_solution import pack_solution
+
+        print("Packing solution from source files...")
+        solution_path = pack_solution()
+
+    print("\nLoading solution...")
+    solution = Solution.model_validate_json(solution_path.read_text(encoding="utf-8"))
+    print(f"Loaded: {solution.name} ({solution.definition})")
+    return solution
+
+
 @app.local_entrypoint()
-def main(profile: bool = False, workload_uuids: str = ""):
+def main(
+    profile: bool = False,
+    ncu: bool = False,
+    ncu_only: bool = False,
+    workload_uuids: str = "",
+    solution_json: str = "",
+):
     """Pack solution and run benchmark on Modal.
     
     Args:
         profile: Run torch.profiler on a representative workload (adds ~5s).
+        ncu: Run Nsight Compute on one representative large workload.
+        ncu_only: Skip the benchmark pass and run only Nsight Compute.
         workload_uuids: Comma-separated workload UUIDs to benchmark.
+        solution_json: Optional path to an existing solution JSON file. If empty,
+            the script packs the current repo's sources before benchmarking.
     """
-    from scripts.pack_solution import pack_solution
-
-    print("Packing solution from source files...")
-    solution_path = pack_solution()
-
-    print("\nLoading solution...")
-    solution = Solution.model_validate_json(solution_path.read_text())
-    print(f"Loaded: {solution.name} ({solution.definition})")
+    solution = _load_solution(solution_json)
 
     print("\nRunning benchmark on Modal B200...")
     print(f"Using pinned Modal stack: {format_pinned_stack()}")
     print("Benchmark container stays warm between runs for reproducibility and lower startup overhead.")
+    print("Evaluation strategy mirrors `EVALUATION.md` for MoE: isolated runner, resume,")
+    print("saved traces, timeout=300, atol=1, rtol=0.3, required_matched_ratio=0.9.")
     if profile:
         print("  (profiling enabled)")
+    if ncu:
+        print("  (NCU enabled)")
+    if ncu_only:
+        print("  (NCU-only mode)")
     selected_workloads = tuple(
         uuid.strip() for uuid in workload_uuids.split(",") if uuid.strip()
     )
     if selected_workloads:
         print(f"  (filtering to {len(selected_workloads)} workloads)")
     runner = BenchmarkRunner()
-    results = runner.run_benchmark.remote(
-        solution,
-        profile=profile,
-        workload_uuids=selected_workloads,
-    )
+    ncu_runner = NcuRunner() if ncu else None
 
-    if not results:
-        print("No results returned!")
+    if ncu_only and not ncu:
+        print("NCU-only mode requires `--ncu`.")
         return
 
-    print_results(results)
+    if not ncu_only:
+        results = runner.run_benchmark.remote(
+            solution,
+            profile=profile,
+            workload_uuids=selected_workloads,
+        )
 
-    # Print profiling data if present (will be captured by model.py)
-    profiling_text = results.get("__profiling__")
-    if profiling_text:
-        print(profiling_text)
-        print("\nTEST HARNESS COMPLETE")
+        if not results:
+            print("No results returned!")
+            return
+
+        print_results(results)
+
+        # Print profiling data if present (will be captured by model.py)
+        profiling_text = results.get("__profiling__")
+        if profiling_text:
+            print(profiling_text)
+            print("\nTEST HARNESS COMPLETE")
+
+    if ncu:
+        ncu_output = ncu_runner.run_ncu.remote(
+            solution,
+            workload_uuids=selected_workloads,
+        )
+        print(f"\n{NCU_OUTPUT_START}")
+        print(ncu_output)
+        print(NCU_OUTPUT_END)

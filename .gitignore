@@ -1,5 +1,9 @@
 # FlashInfer Competition
 solution.json
+mlsys26-contest/
+EVALUATION.md
+FAQ.md
+tmp/
 
 # CUDA build artifacts
 *.o
