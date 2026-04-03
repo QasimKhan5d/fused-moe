@@ -1,5 +1,5 @@
 [solution]
-name = "fp8_mloop_fused_moe_v8_prescale_bf16_large_regime"
+name = "fp8_mloop_fused_moe_v9_unpredicated_evict_first_bf16_epilogue"
 definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
 author = "KernelEvolve"
 

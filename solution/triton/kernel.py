@@ -3,8 +3,6 @@ Fused MoE Triton Kernel - Evolved by KernelEvolve.
 
 FlashInfer entry: kernel.py::kernel
 """
-
-# EDITABLE-IMPORTS
 import torch
 import triton
 import triton.language as tl
@@ -116,7 +114,6 @@ def gemm1_mloop_kernel(
 
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
-    n_mask = offs_n < H
 
     w_ptr_base = W_ptr + eid * stride_we
     ws_ptr_base = W_scale_ptr + eid * stride_wse
@@ -128,51 +125,28 @@ def gemm1_mloop_kernel(
         token_offset = off_start + offs_m
         idx = tl.load(Idx_ptr + token_offset, mask=m_mask, other=0)
 
-        a_ptr_base = A_ptr + idx[:, None] * stride_am
+        a_ptr_iter = A_ptr + idx[:, None] * stride_am + offs_k[None, :] * stride_ak
         a_scale_base = A_scale_ptr + idx[:, None] * stride_asm
+        
+        w_gate_ptr_iter = w_ptr_base + offs_n[None, :] * stride_wn + offs_k[:, None] * stride_wk
+        w_up_ptr_iter = w_ptr_base + (offs_n[None, :] + H) * stride_wn + offs_k[:, None] * stride_wk
 
         acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
+        # Unpredicated inner loop via pointer scalar increments
         for k in range(0, K, BLOCK_K):
-            k_mask = (k + offs_k) < K
-
-            a = tl.load(
-                a_ptr_base + (k + offs_k[None, :]) * stride_ak,
-                mask=m_mask[:, None] & k_mask[None, :],
-                other=0.0,
-            )
+            a = tl.load(a_ptr_iter)
 
             k_blk = k // 128
-            sa = tl.load(
-                a_scale_base + k_blk * stride_ask,
-                mask=m_mask[:, None],
-                other=1.0,
-            )
+            sa = tl.load(a_scale_base + k_blk * stride_ask)
 
-            w_gate = tl.load(
-                w_ptr_base + offs_n[None, :] * stride_wn + (k + offs_k[:, None]) * stride_wk,
-                mask=n_mask[None, :] & k_mask[:, None],
-                other=0.0,
-                eviction_policy='evict_last',
-            )
-            w_up = tl.load(
-                w_ptr_base + (offs_n[None, :] + H) * stride_wn + (k + offs_k[:, None]) * stride_wk,
-                mask=n_mask[None, :] & k_mask[:, None],
-                other=0.0,
-                eviction_policy='evict_last',
-            )
+            # Action: gemm1_weight_evict_first
+            w_gate = tl.load(w_gate_ptr_iter, eviction_policy='evict_first')
+            w_up = tl.load(w_up_ptr_iter, eviction_policy='evict_first')
 
-            sw_gate = tl.load(
-                ws_ptr_base + (offs_n[None, :] // 128) * stride_wsn + k_blk * stride_wsk,
-                mask=n_mask[None, :],
-                other=1.0,
-            )
-            sw_up = tl.load(
-                ws_ptr_base + ((offs_n[None, :] + H) // 128) * stride_wsn + k_blk * stride_wsk,
-                mask=n_mask[None, :],
-                other=1.0,
-            )
+            sw_gate = tl.load(ws_ptr_base + (offs_n[None, :] // 128) * stride_wsn + k_blk * stride_wsk)
+            sw_up = tl.load(ws_ptr_base + ((offs_n[None, :] + H) // 128) * stride_wsn + k_blk * stride_wsk)
 
             a_dq = (a.to(tl.float32) * sa).to(tl.bfloat16)
             w_gate_dq = (w_gate.to(tl.float32) * sw_gate).to(tl.bfloat16)
@@ -180,10 +154,24 @@ def gemm1_mloop_kernel(
             acc_gate += tl.dot(a_dq, w_gate_dq)
             acc_up += tl.dot(a_dq, w_up_dq)
 
-        acc_up = acc_up * tl.sigmoid(acc_up)
-        out = (acc_gate * acc_up).to(tl.bfloat16)
-        out_ptr_base = Out_ptr + token_offset[:, None] * stride_om + offs_n[None, :] * stride_on
-        tl.store(out_ptr_base, out, mask=m_mask[:, None] & n_mask[None, :])
+            a_ptr_iter += BLOCK_K * stride_ak
+            w_gate_ptr_iter += BLOCK_K * stride_wk
+            w_up_ptr_iter += BLOCK_K * stride_wk
+
+        # Downcast accumulators before gating multiplication
+        acc_up_bf16 = (acc_up * tl.sigmoid(acc_up)).to(tl.bfloat16)
+        acc_gate_bf16 = acc_gate.to(tl.bfloat16)
+        out = acc_gate_bf16 * acc_up_bf16
+
+        out_block_ptr = tl.make_block_ptr(
+            base=Out_ptr + off_start * stride_om,
+            shape=(count, H),
+            strides=(stride_om, stride_on),
+            offsets=(m_base, pid_n * BLOCK_N),
+            block_shape=(BLOCK_M, BLOCK_N),
+            order=(1, 0),
+        )
+        tl.store(out_block_ptr, out, boundary_check=(0, 1))
 
 
 @triton.jit
@@ -220,59 +208,107 @@ def gemm2_mloop_kernel(
         token_offset = off_start + offs_m
         gating_w = tl.load(Weight_ptr + token_offset, mask=m_mask, other=0.0)
 
-        c_ptr_base = C_ptr + token_offset[:, None] * stride_cm
+        c_ptr_iter = C_ptr + token_offset[:, None] * stride_cm + offs_k[None, :] * stride_ck
+        w_ptr_iter = w_ptr_base + offs_n[None, :] * stride_wn + offs_k[:, None] * stride_wk
+
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
+        # Unpredicated inner loop via pointer scalar increments
         for k in range(0, K, BLOCK_K):
-            k_mask = (k + offs_k) < K
+            c = tl.load(c_ptr_iter)
 
-            c = tl.load(
-                c_ptr_base + (k + offs_k[None, :]) * stride_ck,
-                mask=m_mask[:, None] & k_mask[None, :],
-                other=0.0,
-            )
-
-            w_tile = tl.load(
-                w_ptr_base + offs_n[None, :] * stride_wn + (k + offs_k[:, None]) * stride_wk,
-                mask=n_mask[None, :] & k_mask[:, None],
-                other=0.0,
-                eviction_policy='evict_last',
-            )
+            # Evict first to prevent the massive K=14336 weight tensors from polluting L2 cache
+            w_tile = tl.load(w_ptr_iter, eviction_policy='evict_first')
 
             k_blk = k // 128
-            sw = tl.load(
-                ws_ptr_base + (offs_n[None, :] // 128) * stride_wsn + k_blk * stride_wsk,
-                mask=n_mask[None, :],
-                other=1.0,
-            )
+            sw = tl.load(ws_ptr_base + (offs_n[None, :] // 128) * stride_wsn + k_blk * stride_wsk)
 
             w_dq = (w_tile.to(tl.float32) * sw).to(tl.bfloat16)
             acc += tl.dot(c, w_dq)
 
-        acc = acc * gating_w[:, None]
+            c_ptr_iter += BLOCK_K * stride_ck
+            w_ptr_iter += BLOCK_K * stride_wk
+
+        # Downcast accumulators and gating weights before elementwise multiply to reduce ALU cost
+        gating_w_bf16 = gating_w[:, None].to(tl.bfloat16)
+        acc_bf16 = acc.to(tl.bfloat16) * gating_w_bf16
         orig_idx = tl.load(Idx_ptr + token_offset, mask=m_mask, other=0)
         out_ptrs = Out_ptr + orig_idx[:, None] * stride_om + offs_n[None, :] * stride_on
-        tl.atomic_add(out_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
+        tl.atomic_add(out_ptrs, acc_bf16, mask=m_mask[:, None] & n_mask[None, :])
 
 
 @triton.jit
-def finalize_cast_zero_kernel(
-    In_ptr,
-    Out_ptr,
-    numel,
-    BLOCK: tl.constexpr,
+def fused_route_topk_kernel(
+    Logits_ptr, Bias_ptr,
+    TopkWeights_ptr, TopkIdx_ptr,
+    Counts_ptr,
+    stride_l_t, stride_l_e,
+    stride_w_t, stride_w_k,
+    stride_i_t, stride_i_k,
+    T, routed_scaling_factor,
+    local_start, num_local_experts,
+    E_GLOBAL: tl.constexpr, N_GROUP: tl.constexpr, GROUP_SIZE: tl.constexpr,
+    TOPK_GROUP: tl.constexpr, TOP_K: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < numel
+    if pid >= T:
+        return
 
-    x = tl.load(In_ptr + offs, mask=mask, other=0.0)
-    tl.store(Out_ptr + offs, x.to(tl.bfloat16), mask=mask)
-    tl.store(In_ptr + offs, 0.0, mask=mask)
+    offs = tl.arange(0, E_GLOBAL)
+    logits = tl.load(Logits_ptr + pid * stride_l_t + offs * stride_l_e)
+    bias = tl.load(Bias_ptr + offs)
+
+    s = tl.sigmoid(logits)
+    s_wb = s + bias
+
+    s_wb_2d = tl.reshape(s_wb, (N_GROUP, GROUP_SIZE))
+    max_idx1 = tl.argmax(s_wb_2d, axis=1)
+
+    offs_group = tl.arange(0, GROUP_SIZE)
+    mask1 = offs_group[None, :] == max_idx1[:, None]
+    s_wb_2d_masked = tl.where(mask1, -float('inf'), s_wb_2d)
+
+    max_val1 = tl.max(s_wb_2d, axis=1)
+    max_val2 = tl.max(s_wb_2d_masked, axis=1)
+
+    group_scores = max_val1 + max_val2
+
+    offs_ng = tl.arange(0, N_GROUP)
+    valid_groups_mask = tl.zeros((N_GROUP,), dtype=tl.int32)
+
+    for _ in range(TOPK_GROUP):
+        g_max_idx = tl.argmax(group_scores, axis=0)
+        valid_groups_mask = tl.where(offs_ng == g_max_idx, 1, valid_groups_mask)
+        group_scores = tl.where(offs_ng == g_max_idx, -float('inf'), group_scores)
+
+    valid_groups_mask_2d = tl.broadcast_to(valid_groups_mask[:, None], (N_GROUP, GROUP_SIZE))
+    valid_elements_mask = tl.reshape(valid_groups_mask_2d, (E_GLOBAL,))
+    s_wb_filtered = tl.where(valid_elements_mask == 1, s_wb, -float('inf'))
+
+    sum_s = 0.0
+    for k in range(TOP_K):
+        max_idx = tl.argmax(s_wb_filtered, axis=0)
+        s_val = tl.sum(tl.where(offs == max_idx, s, 0.0), axis=0)
+
+        expert_i32 = max_idx.to(tl.int32)
+        tl.store(TopkWeights_ptr + pid * stride_w_t + k * stride_w_k, s_val)
+        tl.store(TopkIdx_ptr + pid * stride_i_t + k * stride_i_k, expert_i32)
+
+        expert_local = expert_i32 - local_start
+        is_local = (expert_local >= 0) & (expert_local < num_local_experts)
+        tl.atomic_add(Counts_ptr + expert_local, 1, mask=is_local)
+
+        sum_s += s_val
+        s_wb_filtered = tl.where(offs == max_idx, -float('inf'), s_wb_filtered)
+
+    offs_k = tl.arange(0, TOP_K)
+    topk_s_loaded = tl.load(TopkWeights_ptr + pid * stride_w_t + offs_k * stride_w_k)
+    assign_w = topk_s_loaded * (routed_scaling_factor / (sum_s + 1e-20))
+    tl.store(TopkWeights_ptr + pid * stride_w_t + offs_k * stride_w_k, assign_w)
 
 
-_graph_cache = {}
 _workspace_cache = {}
+_routing_buffer_cache = {}
 _pipeline_cache = {}
 
 
@@ -286,108 +322,109 @@ def _exclusive_cumsum_zero_triton(counts: torch.Tensor, offsets: torch.Tensor, n
     )
 
 
-@torch.no_grad()
-def _route_topk_impl(logits: torch.Tensor, bias: torch.Tensor):
-    T = logits.shape[0]
-    if logits.dtype != torch.float32:
-        logits = logits.to(torch.float32)
-    if bias.dtype != torch.float32:
-        bias = bias.to(torch.float32)
-    bias = bias.reshape(-1)
+def _get_routing_buffers(device, T, top_k_val, num_assignments, num_local_experts):
+    state = _routing_buffer_cache.get(device)
+    if state is None:
+        t_cap = max(1, T)
+        a_cap = max(1, num_assignments)
+        e_cap = max(1, num_local_experts)
+    else:
+        t_cap = state["t_cap"]
+        a_cap = state["a_cap"]
+        e_cap = state["e_cap"]
 
-    s = torch.sigmoid(logits)
-    s_with_bias = s + bias
-
-    s_wb_grouped = s_with_bias.view(T, N_GROUP, GROUP_SIZE)
-    top2_vals, _ = torch.topk(s_wb_grouped, k=2, dim=2, largest=True, sorted=False)
-    group_scores = top2_vals.sum(dim=2)
-
-    _, group_idx = torch.topk(group_scores, k=TOPK_GROUP, dim=1, largest=True, sorted=False)
-
-    group_idx_exp = group_idx.unsqueeze(-1).expand(T, TOPK_GROUP, GROUP_SIZE)
-    selected = torch.gather(s_wb_grouped, 1, group_idx_exp)
-    selected_flat = selected.reshape(T, TOPK_GROUP * GROUP_SIZE)
-
-    _, topk_local = torch.topk(selected_flat, k=TOP_K, dim=1, largest=True, sorted=False)
-
-    group_sel = torch.div(topk_local, GROUP_SIZE, rounding_mode='floor')
-    in_group = topk_local - group_sel * GROUP_SIZE
-
-    topk_group = torch.gather(group_idx, 1, group_sel)
-    topk_idx = topk_group * GROUP_SIZE + in_group
-
-    topk_s = torch.gather(s, 1, topk_idx)
-    return topk_s, topk_idx
-
-
-@torch.no_grad()
-def route_topk(
-    routing_logits: torch.Tensor,
-    routing_bias: torch.Tensor,
-    routed_scaling_factor: float,
-):
-    T = routing_logits.shape[0]
-    key = (
-        T,
-        int(routing_logits.shape[1]),
-        int(routing_bias.numel()),
-        routing_logits.device,
-        routing_logits.dtype,
-        routing_bias.dtype,
+    need_grow = (
+        state is None
+        or T > t_cap
+        or num_assignments > a_cap
+        or num_local_experts > e_cap
     )
+    if need_grow:
+        if state is not None:
+            t_cap = max(T, t_cap * 2)
+            a_cap = max(num_assignments, a_cap * 2)
+            e_cap = max(num_local_experts, e_cap * 2)
+        _routing_buffer_cache[device] = {
+            "t_cap": t_cap,
+            "a_cap": a_cap,
+            "e_cap": e_cap,
+            "assign_w": torch.empty((t_cap, TOP_K), device=device, dtype=torch.float32),
+            "topk_idx": torch.empty((t_cap, TOP_K), device=device, dtype=torch.int32),
+            "counts": torch.zeros(e_cap, device=device, dtype=torch.int32),
+            "offsets": torch.empty(e_cap + 1, device=device, dtype=torch.int32),
+            "sorted_token_ids": torch.empty(a_cap, device=device, dtype=torch.int32),
+            "sorted_weights": torch.empty(a_cap, device=device, dtype=torch.float32),
+        }
+        state = _routing_buffer_cache[device]
+    else:
+        state = _routing_buffer_cache[device]
 
-    if key not in _graph_cache:
-        static_logits = torch.empty_like(routing_logits)
-        static_bias = torch.empty_like(routing_bias)
-        static_logits.copy_(routing_logits)
-        static_bias.copy_(routing_bias)
-
-        _route_topk_impl(static_logits, static_bias)
-
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            static_s, static_idx = _route_topk_impl(static_logits, static_bias)
-
-        _graph_cache[key] = (g, static_logits, static_bias, static_s, static_idx)
-
-    g, static_logits, static_bias, static_s, static_idx = _graph_cache[key]
-    static_logits.copy_(routing_logits)
-    static_bias.copy_(routing_bias)
-    g.replay()
-    return static_s, static_idx
+    assign_w = state["assign_w"][:T, :top_k_val]
+    topk_idx = state["topk_idx"][:T, :top_k_val]
+    counts = state["counts"][:num_local_experts]
+    offsets = state["offsets"][:num_local_experts + 1]
+    sorted_token_ids = state["sorted_token_ids"][:num_assignments]
+    sorted_weights = state["sorted_weights"][:num_assignments]
+    return assign_w, topk_idx, counts, offsets, sorted_token_ids, sorted_weights
 
 
 def _run_compute_pipeline(
-    topk_s, topk_idx, hidden_states, hidden_states_scale,
+    routing_logits, routing_bias, assign_w, topk_idx,
+    hidden_states, hidden_states_scale,
     gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale,
     local_start, routed_scaling_factor,
     T, num_experts, K1, N2, K2, H, num_assignments, TOP_K_val,
-    counts, offsets, sorted_token_ids, sorted_weights, C_act, out_fp32, out_bf16,
+    counts, offsets, sorted_token_ids, sorted_weights, C_act, out_bf16,
     is_medium_large_regime, is_huge_regime, num_local_experts,
 ):
-    assign_w = topk_s * (routed_scaling_factor / (topk_s.sum(dim=1, keepdim=True) + 1e-20))
     counts.zero_()
-    BLOCK_DISPATCH = 1024
-    dispatch_count_kernel[(triton.cdiv(num_assignments, BLOCK_DISPATCH),)](
-        topk_idx, counts, num_assignments, local_start, num_local_experts, 1,
-        BLOCK=BLOCK_DISPATCH, num_warps=2,
-        num_stages=1 if (is_medium_large_regime or is_huge_regime) else 2,
+    fused_route_topk_kernel[(T,)](
+        routing_logits, routing_bias,
+        assign_w, topk_idx, counts,
+        routing_logits.stride(0), routing_logits.stride(1),
+        assign_w.stride(0), assign_w.stride(1),
+        topk_idx.stride(0), topk_idx.stride(1),
+        T, routed_scaling_factor, local_start, num_local_experts,
+        E_GLOBAL=E_GLOBAL, N_GROUP=N_GROUP, GROUP_SIZE=GROUP_SIZE,
+        TOPK_GROUP=TOPK_GROUP, TOP_K=TOP_K_val,
+        num_warps=4, num_stages=1
     )
     _exclusive_cumsum_zero_triton(counts, offsets, num_local_experts)
-    if num_assignments < 4096:
+
+    if num_assignments < 1024:
+        BDS, sw_, ss_ = 64, 2, 1
+    elif num_assignments < 4096:
         BDS, sw_, ss_ = 128, 4, 1
     else:
         BDS, sw_, ss_ = 1024, 2, 2
+
     dispatch_scatter_kernel[(triton.cdiv(num_assignments, BDS),)](
         topk_idx, assign_w, offsets, counts, sorted_token_ids, sorted_weights,
         num_assignments, TOP_K_val, local_start, num_local_experts, 1, 1,
         BLOCK=BDS, num_warps=sw_, num_stages=ss_,
     )
-    if num_assignments >= 4096:
-        BM1, BM2, gs1, gs2 = 64, 64, 3, 3
+
+    if num_assignments >= 8192:
+        BM1, BM2, gs1, gs2 = 128, 128, 4, 4
+        BN1, BK1, BK2, BN2 = 128, 64, 64, 128
+        gw1, gw2 = 8, 8
+    elif num_assignments >= 4096:
+        BM1, BM2, gs1, gs2 = 64, 64, 4, 4
+        BN1, BK1, BK2, BN2 = 128, 64, 64, 128
+        gw1, gw2 = 8, 8
+    elif num_assignments >= 1024:
+        BM1, BM2, gs1, gs2 = 32, 32, 4, 4
+        BN1, BK1, BK2, BN2 = 64, 64, 64, 64
+        gw1, gw2 = 4, 4
     else:
         BM1, BM2, gs1, gs2 = 16, 16, 3, 3
-    BN1, BK1, BK2, BN2 = 64, 128, 64, 64
+        BN1, BK1, BK2, BN2 = 64, 64, 64, 64
+        gw1, gw2 = 2, 2
+
+    gemm1_num_warps = gw1
+    if BM1 <= 32:
+        gemm1_num_warps = gw1
+
     gemm1_mloop_kernel[(triton.cdiv(H, BN1), num_experts)](
         hidden_states, hidden_states_scale, sorted_token_ids, offsets,
         gemm1_weights, gemm1_weights_scale, C_act, H, K1,
@@ -396,23 +433,17 @@ def _run_compute_pipeline(
         gemm1_weights.stride(0), gemm1_weights.stride(1), gemm1_weights.stride(2),
         gemm1_weights_scale.stride(0), gemm1_weights_scale.stride(1), gemm1_weights_scale.stride(2),
         C_act.stride(0), C_act.stride(1),
-        BLOCK_M=BM1, BLOCK_N=BN1, BLOCK_K=BK1, num_warps=4, num_stages=gs1,
+        BLOCK_M=BM1, BLOCK_N=BN1, BLOCK_K=BK1, num_warps=gemm1_num_warps, num_stages=gs1,
     )
-    gw2 = 8 if is_huge_regime else 4
+    out_bf16.zero_()
     gemm2_mloop_kernel[(triton.cdiv(N2, BN2), num_experts)](
         C_act, offsets, sorted_weights, sorted_token_ids,
-        gemm2_weights, gemm2_weights_scale, out_fp32, N2, K2,
+        gemm2_weights, gemm2_weights_scale, out_bf16, N2, K2,
         C_act.stride(0), C_act.stride(1),
         gemm2_weights.stride(0), gemm2_weights.stride(1), gemm2_weights.stride(2),
         gemm2_weights_scale.stride(0), gemm2_weights_scale.stride(1), gemm2_weights_scale.stride(2),
-        out_fp32.stride(0), out_fp32.stride(1),
+        out_bf16.stride(0), out_bf16.stride(1),
         BLOCK_M=BM2, BLOCK_N=BN2, BLOCK_K=BK2, num_warps=gw2, num_stages=gs2,
-    )
-    numel = T * N2
-    BF = 1024 if (is_medium_large_regime or is_huge_regime) else 256
-    finalize_cast_zero_kernel[(triton.cdiv(numel, BF),)](
-        out_fp32, out_bf16, numel, BLOCK=BF,
-        num_warps=8 if (is_medium_large_regime or is_huge_regime) else 4, num_stages=2,
     )
 
 
@@ -441,51 +472,66 @@ def custom_kernel(
     K2 = int(gemm2_weights.shape[2])
     H = N1 // 2
 
-    topk_s, topk_idx = route_topk(routing_logits, routing_bias, routed_scaling_factor)
-    TOP_K_val = topk_idx.shape[1]
+    TOP_K_val = TOP_K
     num_assignments = T * TOP_K_val
     num_local_experts = num_experts
     local_start = int(local_expert_offset)
 
-    ws_key = (device, T, num_assignments, num_local_experts, H, N2)
+    assign_w, topk_idx, counts, offsets, sorted_token_ids, sorted_weights = _get_routing_buffers(
+        device, T, TOP_K_val, num_assignments, num_local_experts
+    )
+
+    ws_key = (device, T, num_assignments, H, N2)
     if ws_key not in _workspace_cache:
         _workspace_cache[ws_key] = (
-            torch.zeros(num_local_experts, device=device, dtype=torch.int32),
-            torch.empty(num_local_experts + 1, device=device, dtype=torch.int32),
-            torch.empty(num_assignments, device=device, dtype=torch.int32),
-            torch.empty(num_assignments, device=device, dtype=torch.float32),
-            torch.empty((num_assignments, H), device=device, dtype=torch.bfloat16),
-            torch.zeros((T, N2), device=device, dtype=torch.float32),
+            torch.empty((num_assignments + 128, H), device=device, dtype=torch.bfloat16), # Padded to allow unmasked load/stores
             torch.empty((T, N2), device=device, dtype=torch.bfloat16),
         )
-    counts, offsets, sorted_token_ids, sorted_weights, C_act, out_fp32, out_bf16 = _workspace_cache[ws_key]
+    C_act, out_bf16 = _workspace_cache[ws_key]
 
     pkey = (T, device, id(gemm1_weights), id(gemm1_weights_scale), id(gemm2_weights), id(gemm2_weights_scale))
     if pkey not in _pipeline_cache:
+        static_logits = torch.empty_like(routing_logits)
+        static_bias = torch.empty_like(routing_bias)
         static_hs = torch.empty_like(hidden_states)
         static_hs_scale = torch.empty_like(hidden_states_scale)
+
+        static_logits.copy_(routing_logits)
+        static_bias.copy_(routing_bias)
         static_hs.copy_(hidden_states)
         static_hs_scale.copy_(hidden_states_scale)
+
         args = (
-            topk_s, topk_idx, static_hs, static_hs_scale,
+            static_logits, static_bias, assign_w, topk_idx,
+            static_hs, static_hs_scale,
             gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale,
             local_start, routed_scaling_factor,
             T, num_experts, K1, N2, K2, H, num_assignments, TOP_K_val,
-            counts, offsets, sorted_token_ids, sorted_weights, C_act, out_fp32, out_bf16,
+            counts, offsets, sorted_token_ids, sorted_weights, C_act, out_bf16,
             is_medium_large_regime, is_huge_regime, num_local_experts,
         )
         _run_compute_pipeline(*args)
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             _run_compute_pipeline(*args)
-        _pipeline_cache[pkey] = (g, static_hs, static_hs_scale)
+        _pipeline_cache[pkey] = (g, static_logits, static_bias, static_hs, static_hs_scale)
 
-    g, static_hs, static_hs_scale = _pipeline_cache[pkey]
+    g, static_logits, static_bias, static_hs, static_hs_scale = _pipeline_cache[pkey]
+    static_logits.copy_(routing_logits)
+    static_bias.copy_(routing_bias)
     static_hs.copy_(hidden_states)
     static_hs_scale.copy_(hidden_states_scale)
     g.replay()
+    # Action: optimize_inner_loops_and_pipeline
     return out_bf16
 
 # FlashInfer entry point
 kernel = custom_kernel
-run = custom_kernel
+
+def run(routing_logits, routing_bias, hidden_states, hidden_states_scale,
+        gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale,
+        local_expert_offset, routed_scaling_factor):
+    return custom_kernel(routing_logits, routing_bias, hidden_states,
+                         hidden_states_scale, gemm1_weights, gemm1_weights_scale,
+                         gemm2_weights, gemm2_weights_scale,
+                         local_expert_offset, routed_scaling_factor)
