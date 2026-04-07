@@ -20,80 +20,39 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import modal
-from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
+from flashinfer_bench import Solution, TraceSet
 
 app = modal.App("flashinfer-bench")
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 MOUNT_PATH = "/mnt"
 TRACE_SET_PATH = "/mnt/mlsys26-contest"
-PINNED_STACK = {
-    "flashinfer-python": "0.6.4",
-    "torch": "2.9.1",
-    "numpy": "2.4.2",
-    "triton": "3.5.1",
-    "cupti-python": ">=13",
-}
-NCU_PINNED_STACK = {
-    name: version
-    for name, version in PINNED_STACK.items()
-    if name != "cupti-python"
-}
-PINNED_FLASHINFER_BENCH_COMMIT = "0cd5b6e1ed0b5416866d6b81a8295ac2f1e22982"
+OFFICIAL_BENCHMARK_IMAGE = "flashinfer/flashinfer-ci-cu132:latest"
+FLASHINFER_BENCH_GIT_URL = "git+https://github.com/flashinfer-ai/flashinfer-bench.git"
 NCU_OUTPUT_START = "=== NCU OUTPUT START ==="
 NCU_OUTPUT_END = "=== NCU OUTPUT END ==="
 
-
-def format_pinned_stack() -> str:
-    parts = [f"flashinfer-bench@{PINNED_FLASHINFER_BENCH_COMMIT[:7]}"]
-    for name, version in PINNED_STACK.items():
-        if version.startswith((">", "<")):
-            parts.append(f"{name}{version}")
-        else:
-            parts.append(f"{name}=={version}")
-    return ", ".join(parts)
+def format_official_stack_overlay() -> str:
+    return (
+        f"base image {OFFICIAL_BENCHMARK_IMAGE} + "
+        "flashinfer-bench@main (built from source) + cupti-python>=13"
+    )
 
 benchmark_image = (
     modal.Image.from_registry(
-        "nvidia/cuda:12.8.0-devel-ubuntu22.04",
-        add_python="3.12",
+        OFFICIAL_BENCHMARK_IMAGE,
     )
     .entrypoint([])
-    .apt_install(
-        "git", "build-essential", "cmake", "wget", "gnupg",
-        "zlib1g-dev", "libxml2-dev",  # Required for LLVM/TLX build
-    )
+    .apt_install("wget", "gnupg")
     .run_commands(
-        "rm -f /usr/share/keyrings/cuda-archive-keyring.gpg && wget -qO- https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/3bf863cc.pub | gpg --batch --dearmor -o /usr/share/keyrings/cuda-archive-keyring.gpg",
-        "echo 'deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/ /' > /etc/apt/sources.list.d/cuda.list",
-        "apt-get update && apt-get install -y nsight-compute-2026.1.0",
+        "apt-get update && apt-get install -y nsight-compute-2026.1.0 || "
+        "(wget -qO- https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/3bf863cc.pub | gpg --dearmor -o /usr/share/keyrings/cuda-archive-keyring.gpg && "
+        "echo 'deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/ /' > /etc/apt/sources.list.d/cuda.list && "
+        "apt-get update && apt-get install -y nsight-compute-2026.1.0)"
     )
     .pip_install(
-        f"flashinfer-bench @ git+https://github.com/flashinfer-ai/flashinfer-bench.git@{PINNED_FLASHINFER_BENCH_COMMIT}",
-        *[
-            f"{name}{version}" if version.startswith((">", "<")) else f"{name}=={version}"
-            for name, version in PINNED_STACK.items()
-        ]
-    )
-)
-
-ncu_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .apt_install(
-        "git", "build-essential", "cmake", "wget", "gnupg",
-        "zlib1g-dev", "libxml2-dev",
-    )
-    .run_commands(
-        "wget -qO- https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/3bf863cc.pub | gpg --dearmor -o /usr/share/keyrings/cuda-archive-keyring.gpg",
-        "echo 'deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/ /' > /etc/apt/sources.list.d/cuda.list",
-        "apt-get update && apt-get install -y nsight-compute-2026.1.0",
-    )
-    .pip_install(
-        f"flashinfer-bench @ git+https://github.com/flashinfer-ai/flashinfer-bench.git@{PINNED_FLASHINFER_BENCH_COMMIT}",
-        *[
-            f"{name}{version}" if version.startswith((">", "<")) else f"{name}=={version}"
-            for name, version in NCU_PINNED_STACK.items()
-        ]
+        f"flashinfer-bench @ {FLASHINFER_BENCH_GIT_URL}",
+        "cupti-python>=13",
     )
 )
 
@@ -146,20 +105,65 @@ def _select_workload(workloads: list, strategy: str) -> object:
     return workloads[valid[len(valid) // 2][0]]
 
 
-def _official_moe_config(config: BenchmarkConfig | None = None) -> BenchmarkConfig:
-    """Mirror the official MoE evaluation knobs from EVALUATION.md as closely as possible."""
-    if config is None:
-        config = BenchmarkConfig()
+def _find_flashinfer_bench_command() -> list[str]:
+    """Resolve the flashinfer-bench CLI entrypoint inside the container."""
+    binary = shutil.which("flashinfer-bench")
+    if binary:
+        return [binary]
+    return [sys.executable, "-m", "flashinfer_bench"]
 
-    config.warmup_runs = 10
-    config.iterations = 50
-    config.num_trials = 3
-    config.atol = 1.0
-    config.rtol = 0.3
-    config.required_matched_ratio = 0.9
-    config.use_isolated_runner = True
-    config.timeout_seconds = 300
-    return config
+
+def _official_moe_cli_args(dataset_path: Path, definition_name: str) -> list[str]:
+    """Mirror the MoE command in EVALUATION.md as closely as possible."""
+    return _find_flashinfer_bench_command() + [
+        "run",
+        "--local",
+        str(dataset_path),
+        "--definitions",
+        definition_name,
+        "--save-results",
+        "--use-isolated-runner",
+        "--log-level",
+        "INFO",
+        "--resume",
+        "--timeout",
+        "300",
+        "--atol",
+        "1",
+        "--rtol",
+        "0.3",
+        "--required-matched-ratio",
+        "0.9",
+    ]
+
+
+def _serialize_jsonl(models: list) -> str:
+    return "".join(f"{model.model_dump_json(indent=None)}\n" for model in models)
+
+
+def _results_from_trace_set(result_trace_set: TraceSet, definition_name: str) -> dict:
+    traces = result_trace_set.traces.get(definition_name, [])
+    results = {definition_name: {}}
+
+    for trace in traces:
+        if not trace.evaluation:
+            continue
+        entry = {
+            "status": trace.evaluation.status.value,
+            "solution": trace.solution,
+        }
+        if trace.evaluation.performance:
+            entry["latency_ms"] = trace.evaluation.performance.latency_ms
+            entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
+            entry["speedup_factor"] = trace.evaluation.performance.speedup_factor
+        if trace.evaluation.correctness:
+            entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
+            entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
+        if trace.evaluation.log:
+            entry["log"] = trace.evaluation.log
+        results[definition_name][trace.workload.uuid] = entry
+
+    return results
 
 
 @app.cls(
@@ -178,12 +182,12 @@ class BenchmarkRunner:
     def run_benchmark(
         self,
         solution: Solution,
-        config: BenchmarkConfig = None,
         profile: bool = False,
         workload_uuids: tuple[str, ...] = (),
     ) -> dict:
         """Run benchmark on Modal B200 and return results."""
-        config = _official_moe_config(config)
+        import subprocess
+        import tempfile
 
         if solution.definition not in self.trace_set.definitions:
             raise ValueError(f"Definition '{solution.definition}' not found in trace set")
@@ -203,36 +207,56 @@ class BenchmarkRunner:
         if not workloads:
             raise ValueError(f"No workloads found for definition '{solution.definition}'")
 
-        bench_trace_set = TraceSet(
-            root=self.trace_set.root,
-            definitions={definition.name: definition},
-            solutions={definition.name: [solution]},
-            workloads={definition.name: workloads},
-            traces={definition.name: []},
-        )
+        with tempfile.TemporaryDirectory(prefix="flashinfer-bench-cli-") as tmpdir:
+            dataset_path = Path(tmpdir)
+            op_type = definition.op_type
+            definition_dir = dataset_path / "definitions" / op_type
+            solution_dir = dataset_path / "solutions" / solution.author / op_type / definition.name
+            workload_dir = dataset_path / "workloads" / op_type
+            traces_dir = dataset_path / "traces" / op_type
+            blob_link = dataset_path / "blob"
 
-        benchmark = Benchmark(bench_trace_set, config)
-        result_trace_set = benchmark.run_all(dump_traces=True, resume=True)
+            definition_dir.mkdir(parents=True, exist_ok=True)
+            solution_dir.mkdir(parents=True, exist_ok=True)
+            workload_dir.mkdir(parents=True, exist_ok=True)
+            traces_dir.mkdir(parents=True, exist_ok=True)
 
-        traces = result_trace_set.traces.get(definition.name, [])
-        results = {definition.name: {}}
+            source_blob = self.trace_set.root / "blob"
+            if source_blob.exists():
+                blob_link.symlink_to(source_blob, target_is_directory=True)
 
-        for trace in traces:
-            if trace.evaluation:
-                entry = {
-                    "status": trace.evaluation.status.value,
-                    "solution": trace.solution,
-                }
-                if trace.evaluation.performance:
-                    entry["latency_ms"] = trace.evaluation.performance.latency_ms
-                    entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
-                    entry["speedup_factor"] = trace.evaluation.performance.speedup_factor
-                if trace.evaluation.correctness:
-                    entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
-                    entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
-                if trace.evaluation.log:
-                    entry["log"] = trace.evaluation.log
-                results[definition.name][trace.workload.uuid] = entry
+            (definition_dir / f"{definition.name}.json").write_text(
+                definition.model_dump_json(indent=2),
+                encoding="utf-8",
+            )
+            (solution_dir / f"{solution.name}.json").write_text(
+                solution.model_dump_json(indent=2),
+                encoding="utf-8",
+            )
+            (workload_dir / f"{definition.name}.jsonl").write_text(
+                _serialize_jsonl(workloads),
+                encoding="utf-8",
+            )
+
+            proc = subprocess.run(
+                _official_moe_cli_args(dataset_path, definition.name),
+                capture_output=True,
+                text=True,
+            )
+
+            result_trace_set = TraceSet.from_path(str(dataset_path))
+            results = _results_from_trace_set(result_trace_set, definition.name)
+
+            if proc.returncode != 0 and not results[definition.name]:
+                combined_output = []
+                if proc.stdout.strip():
+                    combined_output.append(f"STDOUT:\n{proc.stdout.strip()}")
+                if proc.stderr.strip():
+                    combined_output.append(f"STDERR:\n{proc.stderr.strip()}")
+                raise RuntimeError(
+                    "flashinfer-bench CLI failed before producing any traces.\n\n"
+                    + "\n\n".join(combined_output)
+                )
 
         if profile:
             profiling_text = _profile_solution(
@@ -244,7 +268,7 @@ class BenchmarkRunner:
         return results
 
 @app.cls(
-    image=ncu_image,
+    image=benchmark_image,
     gpu="B200:1",
     timeout=3600,
     volumes={MOUNT_PATH: trace_volume},
@@ -616,7 +640,7 @@ def _run_ncu_solution(
         return "\n\n".join(parts)
 
 
-def print_results(results: dict):
+def print_results(results: dict, full_error_log: bool = False):
     """Print benchmark results in a formatted way."""
     for def_name, traces in results.items():
         if def_name.startswith("__"):  # Skip internal keys like __profiling__
@@ -669,8 +693,8 @@ def print_results(results: dict):
                 uuids_str = ", ".join(group["uuids"])
                 print(f"  Workloads [{uuids_str}]: {group['summary']}")
                 if group["log"]:
-                    # Print first 800 chars of log (tracebacks, errors)
-                    log_preview = group["log"][:800]
+                    # Keep the default output compact unless explicitly asked for full logs.
+                    log_preview = group["log"] if full_error_log else group["log"][:800]
                     for line in log_preview.split("\n"):
                         print(f"    {line}")
             print()
@@ -698,6 +722,7 @@ def main(
     ncu: bool = False,
     ncu_only: bool = False,
     workload_uuids: str = "",
+    full_error_log: bool = False,
     solution_json: str = "",
 ):
     """Pack solution and run benchmark on Modal.
@@ -707,13 +732,14 @@ def main(
         ncu: Run Nsight Compute on one representative large workload.
         ncu_only: Skip the benchmark pass and run only Nsight Compute.
         workload_uuids: Comma-separated workload UUIDs to benchmark.
+        full_error_log: Print complete failure logs instead of truncating them.
         solution_json: Optional path to an existing solution JSON file. If empty,
             the script packs the current repo's sources before benchmarking.
     """
     solution = _load_solution(solution_json)
 
     print("\nRunning benchmark on Modal B200...")
-    print(f"Using pinned Modal stack: {format_pinned_stack()}")
+    print(f"Using benchmark environment: {format_official_stack_overlay()}")
     print("Benchmark container stays warm between runs for reproducibility and lower startup overhead.")
     print("Evaluation strategy mirrors `EVALUATION.md` for MoE: isolated runner, resume,")
     print("saved traces, timeout=300, atol=1, rtol=0.3, required_matched_ratio=0.9.")
@@ -723,6 +749,8 @@ def main(
         print("  (NCU enabled)")
     if ncu_only:
         print("  (NCU-only mode)")
+    if full_error_log:
+        print("  (full error log enabled)")
     selected_workloads = tuple(
         uuid.strip() for uuid in workload_uuids.split(",") if uuid.strip()
     )
@@ -746,7 +774,7 @@ def main(
             print("No results returned!")
             return
 
-        print_results(results)
+        print_results(results, full_error_log=full_error_log)
 
         # Print profiling data if present (will be captured by model.py)
         profiling_text = results.get("__profiling__")
@@ -760,5 +788,6 @@ def main(
             workload_uuids=selected_workloads,
         )
         print(f"\n{NCU_OUTPUT_START}")
+        print(f"NCU environment: {format_official_stack_overlay()}")
         print(ncu_output)
         print(NCU_OUTPUT_END)
