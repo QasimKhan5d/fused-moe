@@ -1,5 +1,5 @@
 [solution]
-name = "fp8_mloop_fused_moe_v9_unpredicated_evict_first_bf16_epilogue"
+name = "fp8_mloop_fused_moe_v10_hybrid_g33_small_g14_medium_g34_large"
 definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
 author = "KernelEvolve"
 
