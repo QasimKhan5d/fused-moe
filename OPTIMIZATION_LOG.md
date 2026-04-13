@@ -201,18 +201,98 @@ Conclusions:
 
 Split-K is now exhausted. The remaining headroom is in the large workloads (T=901 at 24x, T=11948 at 12.5x, T=14107 at 10.7x).
 
+## NCU Profiling (T=14107 on B200)
+
+Successfully ran NCU `--set full` on Modal B200 after fixing `flashinfer_bench` import paths (`entities.*` moved to `data.*` in newer versions) and tuning `--launch-skip 30` to skip warmup kernels.
+
+### GEMM1 (`gemm1_mloop_kernel`, grid=(16, 32, 1)x(256, 1, 1))
+
+| Metric | Value |
+|---|---|
+| Duration | 1.64 ms per call |
+| Compute (SM) Throughput | 34.8% |
+| Memory Throughput | 36.4% |
+| DRAM Throughput | 21.3% |
+| HBM Bandwidth achieved | 1.64 TB/s |
+| L2 Hit Rate | 45.3% |
+| Highest pipeline | TC (Tensor Core) at 34.8% |
+| Register spilling | **1.28M requests, 100% overhead** |
+| Uncoalesced loads | 22.1/32 bytes per sector |
+| NCU verdict | **Latency-bound** (neither compute nor memory near peak) |
+
+Root cause: the double-dot gate+up structure (`acc_gate` + `acc_up`, two `[BM, BN]` FP32 accumulators) exhausts the register file. Spills go through L2, adding latency to every K-iteration.
+
+### GEMM2 (`gemm2_mloop_kernel`, grid=(56, 32, 1)x(256, 1, 1))
+
+| Metric | Value |
+|---|---|
+| Duration | 1.34 ms per call |
+| Compute (SM) Throughput | 22.2% |
+| Memory Throughput | 29.6% |
+| DRAM Throughput | 9.1% |
+| HBM Bandwidth achieved | 695 GB/s |
+| L2 Hit Rate | 76.5% |
+| Highest pipeline | TC (Tensor Core) at 22.2% |
+| Register spilling | None |
+| NCU verdict | **Latency-bound** |
+
+GEMM2 has excellent L2 hit rate but only 22% compute utilization. The `atomic_add` output pattern and scattered token access via `sorted_token_ids` are likely causing stalls.
+
+## BM=256 for Large Workloads (applied)
+
+Increased BLOCK_M from 128 to 256 for the `num_assignments >= 8192` regime (T=11948, T=14107). Larger M-tiles keep expert weight tiles in L2 longer, reducing redundant HBM fetches.
+
+| Workload | BM=128 | BM=256 | Delta |
+|---|---|---|---|
+| T=901 | 25.8x | 25.2x | -0.6x (not in this regime) |
+| T=11948 | 12.5x | **16.2x** | **+3.7x (+29%)** |
+| T=14107 | 10.7x | **14.7x** | **+4.0x (+37%)** |
+| Overall mean | 49.1x | **50.8x** | **+1.7x (+3.4%)** |
+
+BM=512 crashes (exceeds register/SMEM budget). BM=256 is the sweet spot.
+
+## Persistent Kernel Rewrite (rejected)
+
+Attempted to convert GEMM1 and GEMM2 from grid-per-expert M-loop kernels into persistent kernels using `tl.range(start_pid, num_tiles, NUM_SMS, flatten=True)`. Two approaches tested:
+
+### Phase 1A: Persistent fused gate+up (BM=64, BN=64)
+
+Smaller tiles to avoid register spilling. Persistent scheduling to compensate via more tiles per CTA.
+
+| Workload | Baseline | P1A Persistent | Delta |
+|---|---|---|---|
+| T=14107 | 14.4x | **4.73x** | **-67%** |
+| T=901 | 25.8x | 24.8x | flat |
+| Small/medium | unchanged | unchanged | — |
+
+### Phase 1B: Persistent split gate/up (BM=128, BN=128)
+
+Split GEMM1 into separate gate and up projection kernels (single accumulator each, no spilling) plus a SwiGLU fusion kernel. Each projection uses full BM=128, BN=128.
+
+| Workload | Baseline | P1B Persistent | Delta |
+|---|---|---|---|
+| T=14107 | 14.4x | **6.78x** | **-53%** |
+| T=901 | 25.8x | 25.4x | flat |
+| T=55 | 49x | 51.8x | +5% |
+
+### Why persistent scheduling failed
+
+The MoE dispatch pattern is fundamentally incompatible with Triton's `tl.range(flatten=True)` pipelining:
+
+1. **Variable token counts per expert**: Each expert gets a different number of tokens (`count = offsets[eid+1] - offsets[eid]`). This creates a dynamic inner M-loop `range(0, count, BLOCK_M)` inside the persistent outer loop.
+
+2. **`continue` not supported**: Triton 3.6.0 does not support `continue` inside `tl.range`. The workaround (`if count > 0:` guard) creates divergent branches that prevent load pipelining across tile boundaries.
+
+3. **Standard persistent matmul assumes uniform work**: The Triton reference persistent matmul and the PyTorch grouped GEMM blog both assume fixed (M, N, K) per tile. The MoE pattern has variable M per expert, which breaks the pipelining model.
+
+4. **The real fix would require a flat tile list**: Pre-computing all valid (expert, m_tile, n_tile) combinations into a flat index buffer that the persistent kernel iterates over uniformly. This eliminates the dynamic M-loop but adds a host-side dispatch kernel to build the tile list — essentially a different kernel architecture.
+
+Phases 2 (TMA) and 3 (warp specialization) were cancelled since they depend on a working persistent base.
+
 ## What Has NOT Been Tried (Next Steps)
 
-The single most promising remaining path is a **TMA + warp specialization rewrite**, modelled on Triton's own reference MoE kernel (`_p_matmul.py`). Key elements:
+1. **Flat tile list + persistent kernel**: Pre-compute a 1D tile list of all valid (expert, m_offset, n_offset) triples on the host or in a dispatch kernel. The persistent kernel then iterates this list with uniform work per tile. This removes the dynamic M-loop and enables proper pipelining. Higher complexity but the only path to make persistent scheduling work for MoE.
 
-1. **Persistent kernel with `tl.range(warp_specialize=True, flatten=True)`**: Eliminates the M-loop, absorbs all tiles into a flat persistent work-stealing loop. The compiler auto-partitions TMA loads (producer warps) from MMA compute (consumer warps).
+2. **Revisit `tl.dot_scaled` with proper e8m0 weight preprocessing**: The NCU data shows both GEMMs are latency-bound at ~35% compute. If latency hiding can be improved (via TMA or better scheduling), FP8 native MMA (2x throughput of BF16) becomes worth the e8m0 scale format rework. Scales need to be stored as `torch.uint8` with e8m0 encoding baked in at weight-load time.
 
-2. **TMA tensor descriptors**: Host-side `TensorDescriptor` for weights (dense 3D `[1, BLOCK_K, BLOCK_N]`), activation gather via `desc.gather(indices, k_offset)` using 2D `[1, BLOCK_K]` descriptors, output scatter via `desc.scatter(out, indices, n_offset)`.
-
-3. **TMA gather fuses the dispatch step**: Instead of a separate dispatch_scatter kernel writing sorted token IDs to global memory, TMA gather loads tokens directly from their original positions using the index array — eliminating one full memory pass.
-
-4. **Warp specialization requires TMA**: Confirmed experimentally — `warp_specialize=True` without TMA caused a 3.4x regression because the compiler can't partition manual `tl.load` calls into clean producer warps.
-
-5. **Revisit `tl.dot_scaled` with proper e8m0 weight preprocessing**: Once TMA is in place and warp spec hides load latency, the MMA units become the true bottleneck. At that point, FP8 native MMA (2x throughput of BF16) becomes worth the e8m0 scale format rework. Scales need to be stored as `torch.uint8` with e8m0 encoding baked in at weight-load time, not computed on the fly.
-
-6. **CUTLASS/CUDA kernel**: Bypass Triton entirely for more control over MMA instruction selection, register allocation, and TMA. Highest effort but removes all Triton-imposed constraints.
+3. **CUTLASS/CUDA kernel**: Bypass Triton entirely for full control over MMA instruction selection, register allocation, TMA, and warp scheduling. Highest effort but removes all Triton-imposed constraints (no `continue` limitation, explicit register management, custom persistent scheduling).
