@@ -1,7 +1,11 @@
 """
-Fused MoE Triton Kernel - gen_14 standalone (online FP8 weight dequant).
+Fused MoE Triton Kernel - gen_14 standalone (per-tile BF16 weight dequant).
 
-Inherently safe: no cached derived weight buffers across calls.
+Weights are stored as FP8 with block scales. Each GEMM inner-loop iteration
+loads an FP8 weight tile, multiplies by the block scale to produce BF16, then
+feeds BF16 x BF16 into tl.dot. No predequantized weight buffers are cached
+across calls.
+
 All workspace buffers are persisted but contents are recalculated every call.
 
 FlashInfer entry: kernel.py::kernel
@@ -94,14 +98,19 @@ def predequant_hidden_kernel(
 @triton.jit
 def gemm1_mloop_kernel(
     A_dq_ptr, Idx_ptr, Offsets_ptr,
-    W_ptr, W_scale_ptr, Out_ptr, H, K,
+    W_ptr, W_scale_ptr, Out_ptr,
+    Ws_gate_ptr, Ws_up_ptr,
+    H, K,
     stride_adm, stride_adk,
     stride_we, stride_wn, stride_wk, stride_wse, stride_wsn, stride_wsk,
     stride_om, stride_on,
+    stride_wsg_sk, stride_wsg_m, stride_wsg_n,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
     eid = tl.program_id(1)
+    pid_k = tl.program_id(2)
     off_start = tl.load(Offsets_ptr + eid)
     off_end = tl.load(Offsets_ptr + eid + 1)
     count = off_end - off_start
@@ -112,6 +121,8 @@ def gemm1_mloop_kernel(
     n_mask = offs_n < H
     w_ptr_base = W_ptr + eid * stride_we
     ws_ptr_base = W_scale_ptr + eid * stride_wse
+    k_start = pid_k * BLOCK_K
+    k_step = SPLIT_K * BLOCK_K
     for m_base in range(0, count, BLOCK_M):
         offs_m = m_base + tl.arange(0, BLOCK_M)
         m_mask = offs_m < count
@@ -120,12 +131,11 @@ def gemm1_mloop_kernel(
         a_ptr_base = A_dq_ptr + idx[:, None] * stride_adm
         acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-        for k in range(0, K, BLOCK_K):
+        for k in range(k_start, K, k_step):
             k_cur = k + offs_k
-            k_mask = k_cur < K
-            a = tl.load(a_ptr_base + k_cur[None, :] * stride_adk, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
-            w_gate = tl.load(w_ptr_base + offs_n[None, :] * stride_wn + k_cur[:, None] * stride_wk, mask=n_mask[None, :] & k_mask[:, None], other=0.0, eviction_policy='evict_last')
-            w_up = tl.load(w_ptr_base + (offs_n[None, :] + H) * stride_wn + k_cur[:, None] * stride_wk, mask=n_mask[None, :] & k_mask[:, None], other=0.0, eviction_policy='evict_last')
+            a = tl.load(a_ptr_base + k_cur[None, :] * stride_adk, mask=m_mask[:, None], other=0.0)
+            w_gate = tl.load(w_ptr_base + offs_n[None, :] * stride_wn + k_cur[:, None] * stride_wk, mask=n_mask[None, :], other=0.0, eviction_policy='evict_last')
+            w_up = tl.load(w_ptr_base + (offs_n[None, :] + H) * stride_wn + k_cur[:, None] * stride_wk, mask=n_mask[None, :], other=0.0, eviction_policy='evict_last')
             k_blk = k // 128
             sw_gate = tl.load(ws_ptr_base + (offs_n[None, :] // 128) * stride_wsn + k_blk * stride_wsk, mask=n_mask[None, :], other=1.0)
             sw_up = tl.load(ws_ptr_base + ((offs_n[None, :] + H) // 128) * stride_wsn + k_blk * stride_wsk, mask=n_mask[None, :], other=1.0)
@@ -133,10 +143,42 @@ def gemm1_mloop_kernel(
             w_up_dq = (w_up.to(tl.float32) * sw_up.to(tl.float32)).to(tl.bfloat16)
             acc_gate += tl.dot(a, w_gate_dq)
             acc_up += tl.dot(a, w_up_dq)
-        acc_up = acc_up * tl.sigmoid(acc_up)
-        out = (acc_gate * acc_up).to(tl.bfloat16)
-        out_ptr_base = Out_ptr + token_offset[:, None] * stride_om + offs_n[None, :] * stride_on
-        tl.store(out_ptr_base, out, mask=m_mask[:, None] & n_mask[None, :])
+        if SPLIT_K == 1:
+            acc_up = acc_up * tl.sigmoid(acc_up)
+            out = (acc_gate * acc_up).to(tl.bfloat16)
+            out_ptr_base = Out_ptr + token_offset[:, None] * stride_om + offs_n[None, :] * stride_on
+            tl.store(out_ptr_base, out, mask=m_mask[:, None] & n_mask[None, :])
+        else:
+            gate_ptr = Ws_gate_ptr + pid_k * stride_wsg_sk + token_offset[:, None] * stride_wsg_m + offs_n[None, :] * stride_wsg_n
+            up_ptr = Ws_up_ptr + pid_k * stride_wsg_sk + token_offset[:, None] * stride_wsg_m + offs_n[None, :] * stride_wsg_n
+            tl.store(gate_ptr, acc_gate, mask=m_mask[:, None] & n_mask[None, :])
+            tl.store(up_ptr, acc_up, mask=m_mask[:, None] & n_mask[None, :])
+
+@triton.jit
+def gemm1_reduce_swiglu_kernel(
+    Ws_gate_ptr, Ws_up_ptr, Out_ptr,
+    num_assignments, H,
+    stride_wsg_sk, stride_wsg_m, stride_wsg_n,
+    stride_om, stride_on,
+    SPLIT_K: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = offs_m < num_assignments
+    n_mask = offs_n < H
+    acc_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for sk in range(SPLIT_K):
+        gate = tl.load(Ws_gate_ptr + sk * stride_wsg_sk + offs_m[:, None] * stride_wsg_m + offs_n[None, :] * stride_wsg_n, mask=m_mask[:, None] & n_mask[None, :], other=0.0)
+        up = tl.load(Ws_up_ptr + sk * stride_wsg_sk + offs_m[:, None] * stride_wsg_m + offs_n[None, :] * stride_wsg_n, mask=m_mask[:, None] & n_mask[None, :], other=0.0)
+        acc_gate += gate
+        acc_up += up
+    acc_up = acc_up * tl.sigmoid(acc_up)
+    out = (acc_gate * acc_up).to(tl.bfloat16)
+    tl.store(Out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on, out, mask=m_mask[:, None] & n_mask[None, :])
 
 @triton.jit
 def gemm2_mloop_kernel(
@@ -270,6 +312,7 @@ def _run_compute_pipeline(
     local_start, routed_scaling_factor,
     T, num_experts, K1, N2, K2, H, num_assignments, TOP_K_val,
     counts, offsets, sorted_token_ids, sorted_weights, C_act, out_bf16,
+    ws_gate, ws_up,
     is_medium_large_regime, is_huge_regime, num_local_experts,
 ):
     counts.zero_()
@@ -303,26 +346,48 @@ def _run_compute_pipeline(
         BM1, BM2, gs1, gs2 = 128, 128, 3, 3
         BN1, BK1, BK2, BN2 = 128, 64, 64, 128
         gw1, gw2 = 8, 8
+        SPLIT_K = 1
     elif num_assignments >= 4096:
         BM1, BM2, gs1, gs2 = 64, 64, 3, 3
         BN1, BK1, BK2, BN2 = 128, 64, 64, 128
         gw1, gw2 = 8, 8
+        SPLIT_K = 1
     elif num_assignments >= 1024:
         BM1, BM2, gs1, gs2 = 32, 32, 3, 3
         BN1, BK1, BK2, BN2 = 64, 64, 64, 64
         gw1, gw2 = 4, 4
+        SPLIT_K = 1
+    elif num_assignments >= 128:
+        BM1, BM2, gs1, gs2 = 16, 16, 2, 2
+        BN1, BK1, BK2, BN2 = 64, 64, 64, 64
+        gw1, gw2 = 2, 2
+        SPLIT_K = 1
     else:
         BM1, BM2, gs1, gs2 = 16, 16, 2, 2
         BN1, BK1, BK2, BN2 = 64, 64, 64, 64
         gw1, gw2 = 2, 2
-    gemm1_mloop_kernel[(triton.cdiv(H, BN1), num_experts)](
+        SPLIT_K = 4
+    gemm1_mloop_kernel[(triton.cdiv(H, BN1), num_experts, SPLIT_K)](
         hidden_states_dq, sorted_token_ids, offsets,
-        gemm1_weights, gemm1_weights_scale, C_act, H, K1,
+        gemm1_weights, gemm1_weights_scale, C_act,
+        ws_gate, ws_up,
+        H, K1,
         hidden_states_dq.stride(0), hidden_states_dq.stride(1),
         gemm1_weights.stride(0), gemm1_weights.stride(1), gemm1_weights.stride(2),
         gemm1_weights_scale.stride(0), gemm1_weights_scale.stride(1), gemm1_weights_scale.stride(2),
         C_act.stride(0), C_act.stride(1),
-        BLOCK_M=BM1, BLOCK_N=BN1, BLOCK_K=BK1, num_warps=gw1, num_stages=gs1)
+        ws_gate.stride(0), ws_gate.stride(1), ws_gate.stride(2),
+        BLOCK_M=BM1, BLOCK_N=BN1, BLOCK_K=BK1,
+        SPLIT_K=SPLIT_K, num_warps=gw1, num_stages=gs1)
+    if SPLIT_K > 1 and num_assignments > 0:
+        gemm1_reduce_swiglu_kernel[(triton.cdiv(num_assignments, 64), triton.cdiv(H, 64))](
+            ws_gate, ws_up, C_act,
+            num_assignments, H,
+            ws_gate.stride(0), ws_gate.stride(1), ws_gate.stride(2),
+            C_act.stride(0), C_act.stride(1),
+            SPLIT_K=SPLIT_K,
+            BLOCK_M=64, BLOCK_N=64,
+            num_warps=4, num_stages=2)
     out_bf16.zero_()
     gemm2_mloop_kernel[(triton.cdiv(N2, BN2), num_experts)](
         C_act, offsets, sorted_weights, sorted_token_ids,
@@ -353,14 +418,18 @@ def custom_kernel(
     local_start = int(local_expert_offset)
     assign_w, topk_idx, counts, offsets, sorted_token_ids, sorted_weights = _get_routing_buffers(
         device, T, TOP_K_val, num_assignments, num_local_experts)
+    MAX_SPLIT_K = 4
+    need_split = (num_assignments < 4096)
     ws_key = (device, T, num_assignments, K1, H, N2)
     if ws_key not in _workspace_cache:
         _workspace_cache[ws_key] = (
             torch.empty((T, K1), device=device, dtype=torch.bfloat16),
             torch.empty((num_assignments, H), device=device, dtype=torch.bfloat16),
             torch.empty((T, N2), device=device, dtype=torch.bfloat16),
+            torch.empty((MAX_SPLIT_K, num_assignments, H), device=device, dtype=torch.float32) if need_split else torch.empty((1, 1, 1), device=device, dtype=torch.float32),
+            torch.empty((MAX_SPLIT_K, num_assignments, H), device=device, dtype=torch.float32) if need_split else torch.empty((1, 1, 1), device=device, dtype=torch.float32),
         )
-    hidden_states_dq, C_act, out_bf16 = _workspace_cache[ws_key]
+    hidden_states_dq, C_act, out_bf16, ws_gate, ws_up = _workspace_cache[ws_key]
     pkey = (T, device, id(gemm1_weights), id(gemm1_weights_scale), id(gemm2_weights), id(gemm2_weights_scale))
     if pkey not in _pipeline_cache:
         static_logits = torch.empty_like(routing_logits)
@@ -378,6 +447,7 @@ def custom_kernel(
             local_start, routed_scaling_factor,
             T, num_experts, K1, N2, K2, H, num_assignments, TOP_K_val,
             counts, offsets, sorted_token_ids, sorted_weights, C_act, out_bf16,
+            ws_gate, ws_up,
             is_medium_large_regime, is_huge_regime, num_local_experts,
         )
         _run_compute_pipeline(*args)
