@@ -493,10 +493,8 @@ def _run_ncu_solution(
                 from pathlib import Path
 
                 import torch
-                from flashinfer_bench import Solution
+                from flashinfer_bench import Solution, Definition, Workload
                 from flashinfer_bench.compile import BuilderRegistry
-                from flashinfer_bench.entities.definition import Definition
-                from flashinfer_bench.entities.workload import Workload
                 from flashinfer_bench.bench.utils import gen_inputs, load_safetensors
 
                 tmpdir = Path({tmpdir!r})
@@ -571,8 +569,10 @@ def _run_ncu_solution(
             "full",
             "--target-processes",
             "all",
+            "--launch-skip",
+            "30",
             "--launch-count",
-            "10",
+            "20",
             "python",
             str(runner_path),
         ]
