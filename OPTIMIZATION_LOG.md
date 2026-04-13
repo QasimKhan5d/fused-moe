@@ -289,10 +289,57 @@ The MoE dispatch pattern is fundamentally incompatible with Triton's `tl.range(f
 
 Phases 2 (TMA) and 3 (warp specialization) were cancelled since they depend on a working persistent base.
 
+## Split GEMM1 Gate/Up (rejected)
+
+Hypothesis: NCU showed 1.28M register spill requests with 100% overhead in the fused GEMM1 kernel due to the double-dot gate+up accumulator structure (two `[BM, BN]` FP32 accumulators). Splitting into separate gate and up kernels (single accumulator each) should eliminate spilling entirely.
+
+### Results
+
+| Config | T=14107 | T=11948 | T=901 |
+|---|---|---|---|
+| Fused BM=256 (baseline) | **14.4x** | **16.2x** | 25.2x |
+| Split BM=256 | 12.1x | — | 24.4x |
+| Split BM=512 | 12.6x | 11.2x | 25.2x |
+
+Split is **worse** on the exact workloads where spilling was the bottleneck.
+
+### Why the split lost
+
+1. **Activation loads are the expensive part, not the spills.** The fused kernel loads each `[BM, BK]` activation tile once and uses it for both gate and up projections. The split loads it twice — once per kernel. At BM=256, K=2048, BK=64, that's 32 activation tile loads per M-block, doubled to 64 in the split. The activation tensor is scattered via `sorted_token_ids`, so each load is an irregular gather that hits DRAM.
+
+2. **Register spills go through L2, not DRAM.** NCU showed 71.8% of local loads hit L2. The spill penalty is L2 latency (~100 cycles) not DRAM latency (~400 cycles). The activation sharing in the fused kernel saves a full DRAM round-trip per K-iteration, which outweighs the L2 spill cost.
+
+3. **Three kernel launches** (gate + up + SwiGLU) add dispatch overhead and prevent cross-kernel optimization.
+
+The fused double-dot structure is architecturally correct for this workload. The NCU spilling metric is misleading: "100% overhead" means extra instructions relative to zero spills, not a 2x latency penalty. The L2 absorbs the spill traffic.
+
+## Sorted Dispatch for GEMM2 Coalescing (rejected)
+
+Hypothesis: GEMM2's 22% compute utilization despite 76.5% L2 hit rate suggests warp stalls from scattered `C_act` reads via `sorted_token_ids`. Sorting token IDs within each expert's dispatch slice should improve memory coalescing.
+
+Implementation: Triton kernel builds sort keys (`expert_id * T_max + token_id`), PyTorch `argsort` + `index_select` reorders `sorted_token_ids` and `sorted_weights` to be ascending within each expert.
+
+### Result
+
+All workloads failed `INCORRECT_NUMERICAL` (abs_err > 300K) even without CUDA graph capture. The correctness failure persisted after fixing int32/int64 type mismatches in the sort key kernel. Root cause not fully diagnosed — likely a subtle interaction between the `index_select` gather and the routing buffer view semantics.
+
+Abandoned: even if corrected, the expected gain is marginal since GEMM2's primary bottleneck is `atomic_add` contention on the output tensor (TOP_K=8 experts per token), not the `C_act` read coalescing.
+
+## Current Best: 50.8x
+
+The kernel has been optimized through:
+- Online FP8 weight dequant (BF16 x BF16 tensor core path)
+- Split-K=4 for tiny workloads (T<16) with warps=4, stages=3
+- BM=256 for large workloads (T>=10000) for weight L2 reuse
+- CUDA graph caching for the full pipeline
+- Fused routing + top-k + expert counting in a single Triton kernel
+
+This appears to be near the ceiling for the Triton M-loop kernel architecture on B200.
+
 ## What Has NOT Been Tried (Next Steps)
 
-1. **Flat tile list + persistent kernel**: Pre-compute a 1D tile list of all valid (expert, m_offset, n_offset) triples on the host or in a dispatch kernel. The persistent kernel then iterates this list with uniform work per tile. This removes the dynamic M-loop and enables proper pipelining. Higher complexity but the only path to make persistent scheduling work for MoE.
+1. **Flat tile list + persistent kernel**: Pre-compute a 1D tile list of all valid (expert, m_tile, n_tile) triples in a dispatch kernel. The persistent kernel iterates this list with uniform work per tile, eliminating the dynamic M-loop. This is the only path to make persistent scheduling work for MoE with variable expert counts.
 
-2. **Revisit `tl.dot_scaled` with proper e8m0 weight preprocessing**: The NCU data shows both GEMMs are latency-bound at ~35% compute. If latency hiding can be improved (via TMA or better scheduling), FP8 native MMA (2x throughput of BF16) becomes worth the e8m0 scale format rework. Scales need to be stored as `torch.uint8` with e8m0 encoding baked in at weight-load time.
+2. **Revisit `tl.dot_scaled` with proper e8m0 weight preprocessing**: Both GEMMs are latency-bound at ~35% compute. If latency hiding can be improved, FP8 native MMA (2x throughput of BF16) becomes worth the e8m0 scale format rework.
 
-3. **CUTLASS/CUDA kernel**: Bypass Triton entirely for full control over MMA instruction selection, register allocation, TMA, and warp scheduling. Highest effort but removes all Triton-imposed constraints (no `continue` limitation, explicit register management, custom persistent scheduling).
+3. **CUTLASS/CUDA kernel**: Bypass Triton for full control over MMA instruction selection, register allocation, TMA, and warp scheduling. Removes all Triton-imposed constraints.
