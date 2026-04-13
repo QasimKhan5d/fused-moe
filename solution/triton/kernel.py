@@ -343,7 +343,7 @@ def _run_compute_pipeline(
         hidden_states_dq.stride(0), hidden_states_dq.stride(1),
         BLOCK_M=PRE_BM, BLOCK_K=PRE_BK, num_warps=4, num_stages=2)
     if num_assignments >= 8192:
-        BM1, BM2, gs1, gs2 = 128, 128, 3, 3
+        BM1, BM2, gs1, gs2 = 256, 256, 3, 3
         BN1, BK1, BK2, BN2 = 128, 64, 64, 128
         gw1, gw2 = 8, 8
         SPLIT_K = 1
@@ -363,9 +363,9 @@ def _run_compute_pipeline(
         gw1, gw2 = 2, 2
         SPLIT_K = 1
     else:
-        BM1, BM2, gs1, gs2 = 16, 16, 2, 2
+        BM1, BM2, gs1, gs2 = 16, 16, 3, 2
         BN1, BK1, BK2, BN2 = 64, 64, 64, 64
-        gw1, gw2 = 2, 2
+        gw1, gw2 = 4, 2
         SPLIT_K = 4
     gemm1_mloop_kernel[(triton.cdiv(H, BN1), num_experts, SPLIT_K)](
         hidden_states_dq, sorted_token_ids, offsets,

@@ -200,7 +200,8 @@ class BenchmarkRunner:
             filtered_workloads = []
             for workload in workloads:
                 workload_obj = getattr(workload, "workload", workload)
-                if getattr(workload_obj, "uuid", "") in selected:
+                uuid = getattr(workload_obj, "uuid", "")
+                if uuid in selected or any(uuid.startswith(p) for p in selected):
                     filtered_workloads.append(workload)
             workloads = filtered_workloads
 
@@ -297,7 +298,9 @@ class NcuRunner:
             workloads = [
                 workload
                 for workload in workloads
-                if getattr(getattr(workload, "workload", workload), "uuid", "") in selected
+                if (lambda uuid: uuid in selected or any(uuid.startswith(p) for p in selected))(
+                    getattr(getattr(workload, "workload", workload), "uuid", "")
+                )
             ]
 
         if not workloads:
@@ -565,11 +568,11 @@ def _run_ncu_solution(
         cmd = [
             _find_ncu_binary(),
             "--set",
-            "basic",
+            "full",
             "--target-processes",
             "all",
             "--launch-count",
-            "1",
+            "10",
             "python",
             str(runner_path),
         ]
