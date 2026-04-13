@@ -1,5 +1,5 @@
 [solution]
-name = "fp8_mloop_fused_moe_v11_gen14_online_dequant_safe"
+name = "fp8_mloop_fused_moe_v12_splitk_bm256_safe"
 definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
 author = "KernelEvolve"
 
