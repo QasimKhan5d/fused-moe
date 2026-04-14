@@ -1,5 +1,5 @@
 [solution]
-name = "fp8_mloop_fused_moe_v12_splitk_bm256_safe"
+name = "v12_gen28_bf16_best_57x"
 definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
 author = "KernelEvolve"
 

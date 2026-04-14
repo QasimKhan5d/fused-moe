@@ -1,12 +1,5 @@
 """
-Fused MoE Triton Kernel - gen_14 standalone (per-tile BF16 weight dequant).
-
-Weights are stored as FP8 with block scales. Each GEMM inner-loop iteration
-loads an FP8 weight tile, multiplies by the block scale to produce BF16, then
-feeds BF16 x BF16 into tl.dot. No predequantized weight buffers are cached
-across calls.
-
-All workspace buffers are persisted but contents are recalculated every call.
+Fused MoE Triton Kernel - Evolved by KernelEvolve.
 
 FlashInfer entry: kernel.py::kernel
 """
@@ -25,19 +18,21 @@ N_GROUP = 8
 TOPK_GROUP = 4
 GROUP_SIZE = E_GLOBAL // N_GROUP
 
-@triton.jit
-def dispatch_count_kernel(
-    TopkIdx_ptr, Counts_ptr, num_assignments,
-    local_start, num_local_experts, stride_idx,
-    BLOCK: tl.constexpr
-):
-    pid = tl.program_id(0)
-    offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < num_assignments
-    expert_global = tl.load(TopkIdx_ptr + offs * stride_idx, mask=mask, other=-1).to(tl.int32)
-    is_local = (expert_global >= local_start) & (expert_global < (local_start + num_local_experts))
-    expert_local = expert_global - local_start
-    tl.atomic_add(Counts_ptr + expert_local, 1, mask=mask & is_local)
+# <NAME>revert_evict_first_restore_baseline_fix_imports</NAME>
+import torch
+import triton
+import triton.language as tl
+
+# Constants (DeepSeek-V3/R1 geometry)
+H = 7168
+I = 2048
+E_LOCAL = 32
+E_GLOBAL = 256
+BLOCK = 128
+TOP_K = 8
+N_GROUP = 8
+TOPK_GROUP = 4
+GROUP_SIZE = E_GLOBAL // N_GROUP
 
 @triton.jit
 def dispatch_scatter_kernel(
@@ -77,9 +72,9 @@ def scan_and_zero_kernel(Counts_ptr, Offsets_ptr, num_items, BLOCK: tl.constexpr
 
 @triton.jit
 def predequant_hidden_kernel(
-    A_ptr, A_scale_ptr, A_dq_ptr, T, K,
+    A_ptr, A_scale_ptr, A_dq_ptr, Out_ptr, T, K, N2,
     stride_am, stride_ak, stride_asm, stride_ask,
-    stride_dm, stride_dk,
+    stride_dm, stride_dk, stride_om, stride_on,
     BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr
 ):
     pid_m = tl.program_id(0)
@@ -94,6 +89,9 @@ def predequant_hidden_kernel(
     s = tl.load(A_scale_ptr + offs_m[:, None] * stride_asm + k_blk[None, :] * stride_ask, mask=mask, other=1.0)
     a_dq = (a.to(tl.float32) * s.to(tl.float32)).to(tl.bfloat16)
     tl.store(A_dq_ptr + offs_m[:, None] * stride_dm + offs_k[None, :] * stride_dk, a_dq, mask=mask)
+
+    n2_mask = m_mask[:, None] & (offs_k[None, :] < N2)
+    tl.store(Out_ptr + offs_m[:, None] * stride_om + offs_k[None, :] * stride_on, 0.0, mask=n2_mask)
 
 @triton.jit
 def gemm1_mloop_kernel(
@@ -133,16 +131,38 @@ def gemm1_mloop_kernel(
         acc_up = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         for k in range(k_start, K, k_step):
             k_cur = k + offs_k
-            a = tl.load(a_ptr_base + k_cur[None, :] * stride_adk, mask=m_mask[:, None], other=0.0)
-            w_gate = tl.load(w_ptr_base + offs_n[None, :] * stride_wn + k_cur[:, None] * stride_wk, mask=n_mask[None, :], other=0.0, eviction_policy='evict_last')
-            w_up = tl.load(w_ptr_base + (offs_n[None, :] + H) * stride_wn + k_cur[:, None] * stride_wk, mask=n_mask[None, :], other=0.0, eviction_policy='evict_last')
+            a = tl.load(
+                a_ptr_base + k_cur[None, :] * stride_adk,
+                mask=m_mask[:, None],
+                other=0.0,
+            )
+
+            w_gate_blk = tl.make_block_ptr(
+                base=w_ptr_base,
+                shape=(K, H),
+                strides=(stride_wk, stride_wn),
+                offsets=(k, pid_n * BLOCK_N),
+                block_shape=(BLOCK_K, BLOCK_N),
+                order=(0, 1),
+            )
+            w_up_blk = tl.make_block_ptr(
+                base=w_ptr_base + H * stride_wn,
+                shape=(K, H),
+                strides=(stride_wk, stride_wn),
+                offsets=(k, pid_n * BLOCK_N),
+                block_shape=(BLOCK_K, BLOCK_N),
+                order=(0, 1),
+            )
+            w_gate = tl.load(w_gate_blk, boundary_check=(0, 1), padding_option="zero")
+            w_up = tl.load(w_up_blk, boundary_check=(0, 1), padding_option="zero")
+
             k_blk = k // 128
             sw_gate = tl.load(ws_ptr_base + (offs_n[None, :] // 128) * stride_wsn + k_blk * stride_wsk, mask=n_mask[None, :], other=1.0)
             sw_up = tl.load(ws_ptr_base + ((offs_n[None, :] + H) // 128) * stride_wsn + k_blk * stride_wsk, mask=n_mask[None, :], other=1.0)
             w_gate_dq = (w_gate.to(tl.float32) * sw_gate.to(tl.float32)).to(tl.bfloat16)
             w_up_dq = (w_up.to(tl.float32) * sw_up.to(tl.float32)).to(tl.bfloat16)
-            acc_gate += tl.dot(a, w_gate_dq)
-            acc_up += tl.dot(a, w_up_dq)
+            acc_gate += tl.dot(a, w_gate_dq, allow_tf32=True)
+            acc_up += tl.dot(a, w_up_dq, allow_tf32=True)
         if SPLIT_K == 1:
             acc_up = acc_up * tl.sigmoid(acc_up)
             out = (acc_gate * acc_up).to(tl.bfloat16)
@@ -216,7 +236,7 @@ def gemm2_mloop_kernel(
             k_blk = k // 128
             sw = tl.load(ws_ptr_base + (offs_n[None, :] // 128) * stride_wsn + k_blk * stride_wsk, mask=n_mask[None, :], other=1.0)
             w_dq = (w_tile.to(tl.float32) * sw.to(tl.float32)).to(tl.bfloat16)
-            acc += tl.dot(c, w_dq)
+            acc += tl.dot(c, w_dq, allow_tf32=True)
         acc = acc * gating_w[:, None]
         orig_idx = tl.load(Idx_ptr + token_offset, mask=m_mask, other=0)
         out_ptrs = Out_ptr + orig_idx[:, None] * stride_om + offs_n[None, :] * stride_on
@@ -290,7 +310,7 @@ def _get_routing_buffers(device, T, top_k_val, num_assignments, num_local_expert
     need_grow = state is None or T > t_cap or num_assignments > a_cap or num_local_experts > e_cap
     if need_grow:
         if state is not None:
-            t_cap, a_cap, e_cap = max(T, t_cap*2), max(num_assignments, a_cap*2), max(num_local_experts, e_cap*2)
+            t_cap, a_cap, e_cap = max(T, t_cap * 2), max(num_assignments, a_cap * 2), max(num_local_experts, e_cap * 2)
         _routing_buffer_cache[device] = {
             "t_cap": t_cap, "a_cap": a_cap, "e_cap": e_cap,
             "assign_w": torch.empty((t_cap, TOP_K), device=device, dtype=torch.float32),
@@ -301,9 +321,14 @@ def _get_routing_buffers(device, T, top_k_val, num_assignments, num_local_expert
             "sorted_weights": torch.empty(a_cap, device=device, dtype=torch.float32),
         }
     state = _routing_buffer_cache[device]
-    return (state["assign_w"][:T, :top_k_val], state["topk_idx"][:T, :top_k_val],
-            state["counts"][:num_local_experts], state["offsets"][:num_local_experts+1],
-            state["sorted_token_ids"][:num_assignments], state["sorted_weights"][:num_assignments])
+    return (
+        state["assign_w"][:T, :top_k_val],
+        state["topk_idx"][:T, :top_k_val],
+        state["counts"][:num_local_experts],
+        state["offsets"][:num_local_experts + 1],
+        state["sorted_token_ids"][:num_assignments],
+        state["sorted_weights"][:num_assignments],
+    )
 
 def _run_compute_pipeline(
     routing_logits, routing_bias, assign_w, topk_idx,
@@ -323,25 +348,34 @@ def _run_compute_pipeline(
         topk_idx.stride(0), topk_idx.stride(1),
         T, routed_scaling_factor, local_start, num_local_experts,
         E_GLOBAL=E_GLOBAL, N_GROUP=N_GROUP, GROUP_SIZE=GROUP_SIZE,
-        TOPK_GROUP=TOPK_GROUP, TOP_K=TOP_K_val, num_warps=4, num_stages=1)
+        TOPK_GROUP=TOPK_GROUP, TOP_K=TOP_K_val, num_warps=4, num_stages=1
+    )
     _exclusive_cumsum_zero_triton(counts, offsets, num_local_experts)
+
     if num_assignments < 1024:
         BDS, sw_, ss_ = 64, 2, 1
     elif num_assignments < 4096:
         BDS, sw_, ss_ = 128, 4, 1
     else:
         BDS, sw_, ss_ = 1024, 2, 2
+
     dispatch_scatter_kernel[(triton.cdiv(num_assignments, BDS),)](
         topk_idx, assign_w, offsets, counts, sorted_token_ids, sorted_weights,
         num_assignments, TOP_K_val, local_start, num_local_experts, 1, 1,
-        BLOCK=BDS, num_warps=sw_, num_stages=ss_)
+        BLOCK=BDS, num_warps=sw_, num_stages=ss_
+    )
+
     PRE_BM, PRE_BK = 32, 128
-    predequant_hidden_kernel[(triton.cdiv(T, PRE_BM), triton.cdiv(K1, PRE_BK))](
-        hidden_states, hidden_states_scale, hidden_states_dq, T, K1,
+    max_k = max(K1, N2)
+    predequant_hidden_kernel[(triton.cdiv(T, PRE_BM), triton.cdiv(max_k, PRE_BK))](
+        hidden_states, hidden_states_scale, hidden_states_dq, out_bf16, T, K1, N2,
         hidden_states.stride(0), hidden_states.stride(1),
         hidden_states_scale.stride(1), hidden_states_scale.stride(0),
         hidden_states_dq.stride(0), hidden_states_dq.stride(1),
-        BLOCK_M=PRE_BM, BLOCK_K=PRE_BK, num_warps=4, num_stages=2)
+        out_bf16.stride(0), out_bf16.stride(1),
+        BLOCK_M=PRE_BM, BLOCK_K=PRE_BK, num_warps=4, num_stages=2
+    )
+
     if num_assignments >= 8192:
         BM1, BM2, gs1, gs2 = 256, 256, 3, 3
         BN1, BK1, BK2, BN2 = 128, 64, 64, 128
@@ -367,6 +401,7 @@ def _run_compute_pipeline(
         BN1, BK1, BK2, BN2 = 64, 64, 64, 64
         gw1, gw2 = 4, 2
         SPLIT_K = 4
+
     gemm1_mloop_kernel[(triton.cdiv(H, BN1), num_experts, SPLIT_K)](
         hidden_states_dq, sorted_token_ids, offsets,
         gemm1_weights, gemm1_weights_scale, C_act,
@@ -378,7 +413,9 @@ def _run_compute_pipeline(
         C_act.stride(0), C_act.stride(1),
         ws_gate.stride(0), ws_gate.stride(1), ws_gate.stride(2),
         BLOCK_M=BM1, BLOCK_N=BN1, BLOCK_K=BK1,
-        SPLIT_K=SPLIT_K, num_warps=gw1, num_stages=gs1)
+        SPLIT_K=SPLIT_K, num_warps=gw1, num_stages=gs1
+    )
+
     if SPLIT_K > 1 and num_assignments > 0:
         gemm1_reduce_swiglu_kernel[(triton.cdiv(num_assignments, 64), triton.cdiv(H, 64))](
             ws_gate, ws_up, C_act,
@@ -387,8 +424,9 @@ def _run_compute_pipeline(
             C_act.stride(0), C_act.stride(1),
             SPLIT_K=SPLIT_K,
             BLOCK_M=64, BLOCK_N=64,
-            num_warps=4, num_stages=2)
-    out_bf16.zero_()
+            num_warps=4, num_stages=2
+        )
+
     gemm2_mloop_kernel[(triton.cdiv(N2, BN2), num_experts)](
         C_act, offsets, sorted_weights, sorted_token_ids,
         gemm2_weights, gemm2_weights_scale, out_bf16, N2, K2,
@@ -396,7 +434,8 @@ def _run_compute_pipeline(
         gemm2_weights.stride(0), gemm2_weights.stride(1), gemm2_weights.stride(2),
         gemm2_weights_scale.stride(0), gemm2_weights_scale.stride(1), gemm2_weights_scale.stride(2),
         out_bf16.stride(0), out_bf16.stride(1),
-        BLOCK_M=BM2, BLOCK_N=BN2, BLOCK_K=BK2, num_warps=gw2, num_stages=gs2)
+        BLOCK_M=BM2, BLOCK_N=BN2, BLOCK_K=BK2, num_warps=gw2, num_stages=gs2
+    )
 
 @torch.no_grad()
 def custom_kernel(
@@ -416,8 +455,11 @@ def custom_kernel(
     num_assignments = T * TOP_K_val
     num_local_experts = num_experts
     local_start = int(local_expert_offset)
+
     assign_w, topk_idx, counts, offsets, sorted_token_ids, sorted_weights = _get_routing_buffers(
-        device, T, TOP_K_val, num_assignments, num_local_experts)
+        device, T, TOP_K_val, num_assignments, num_local_experts
+    )
+
     MAX_SPLIT_K = 4
     need_split = (num_assignments < 4096)
     ws_key = (device, T, num_assignments, K1, H, N2)
@@ -430,19 +472,16 @@ def custom_kernel(
             torch.empty((MAX_SPLIT_K, num_assignments, H), device=device, dtype=torch.float32) if need_split else torch.empty((1, 1, 1), device=device, dtype=torch.float32),
         )
     hidden_states_dq, C_act, out_bf16, ws_gate, ws_up = _workspace_cache[ws_key]
-    pkey = (T, device, id(gemm1_weights), id(gemm1_weights_scale), id(gemm2_weights), id(gemm2_weights_scale))
+
+    pkey = (
+        T, device, id(gemm1_weights), id(gemm1_weights_scale), id(gemm2_weights), id(gemm2_weights_scale),
+        int(routing_logits.data_ptr()), int(routing_bias.data_ptr()),
+        int(hidden_states.data_ptr()), int(hidden_states_scale.data_ptr()),
+    )
     if pkey not in _pipeline_cache:
-        static_logits = torch.empty_like(routing_logits)
-        static_bias = torch.empty_like(routing_bias)
-        static_hs = torch.empty_like(hidden_states)
-        static_hs_scale = torch.empty_like(hidden_states_scale)
-        static_logits.copy_(routing_logits)
-        static_bias.copy_(routing_bias)
-        static_hs.copy_(hidden_states)
-        static_hs_scale.copy_(hidden_states_scale)
         args = (
-            static_logits, static_bias, assign_w, topk_idx,
-            static_hs, static_hs_scale, hidden_states_dq,
+            routing_logits, routing_bias, assign_w, topk_idx,
+            hidden_states, hidden_states_scale, hidden_states_dq,
             gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale,
             local_start, routed_scaling_factor,
             T, num_experts, K1, N2, K2, H, num_assignments, TOP_K_val,
@@ -454,15 +493,13 @@ def custom_kernel(
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             _run_compute_pipeline(*args)
-        _pipeline_cache[pkey] = (g, static_logits, static_bias, static_hs, static_hs_scale)
-    g, static_logits, static_bias, static_hs, static_hs_scale = _pipeline_cache[pkey]
-    static_logits.copy_(routing_logits)
-    static_bias.copy_(routing_bias)
-    static_hs.copy_(hidden_states)
-    static_hs_scale.copy_(hidden_states_scale)
+        _pipeline_cache[pkey] = (g,)
+
+    (g,) = _pipeline_cache[pkey]
     g.replay()
     return out_bf16
 
+# FlashInfer entry point
 kernel = custom_kernel
 
 def run(routing_logits, routing_bias, hidden_states, hidden_states_scale,
