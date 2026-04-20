@@ -589,7 +589,7 @@ __global__ void swiglu_fp8_requant_kernel(
     int i = tid + j * TB;
     float g = __bfloat162float(row_in[i]);
     float u = __bfloat162float(row_in[H + i]);
-    float act = g * (u / (1.0f + __expf(-u)));
+    float act = g * (u * (0.5f + 0.5f * __tanhf(u * 0.5f)));
     act_cache[j] = act;
     thread_absmax = fmaxf(thread_absmax, fabsf(act));
   }
@@ -783,7 +783,7 @@ __global__ void fused_route_topk_kernel(
   // Step 1: load + sigmoid + bias
   float logit = __bfloat162float(routing_logits[tok * E_GLOBAL + tid]);
   float bias  = __bfloat162float(routing_bias[tid]);
-  float s     = 1.0f / (1.0f + __expf(-logit));
+  float s     = 0.5f + 0.5f * __tanhf(logit * 0.5f);
   float s_wb  = s + bias;
 
   // Step 2: within-warp (group) top-2 values. Find max, then max with it masked.
@@ -1233,7 +1233,7 @@ __global__ void reduce_scatter_kernel(
   int beg = token_offsets[t];
   int end = token_offsets[t + 1];
 
-  const int TB = 256;
+  const int TB = blockDim.x;
   int lane = threadIdx.x;
   const int n2_pairs = N2 / 2;
 
