@@ -1,10 +1,10 @@
 [solution]
-name = "v12_gen28_bf16_best_57x"
+name = "cutlass_sm100_fp8_blockwise_grouped_dual_mma_abswap"
 definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
 author = "KernelEvolve"
 
 [build]
-language = "triton"
+language = "python"
 entry_point = "run"
 binding = "torch"
 destination_passing_style = false
