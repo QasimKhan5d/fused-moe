@@ -1,5 +1,5 @@
 [solution]
-name = "cutlass_sm100_fastsig_rasterM_large_t_win"
+name = "cutlass_sm100_v17_weight_fold"
 definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
 author = "KernelEvolve"
 

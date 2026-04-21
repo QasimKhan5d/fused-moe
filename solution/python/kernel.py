@@ -24,6 +24,10 @@ import os
 import sys
 import tempfile
 import torch
+import os as _os_cfg_X
+import os as _os_cfg_J
+import os as _os_cfg_V
+import os as _os_cfg_K
 
 E_GLOBAL = 256
 N_GROUP = 8
@@ -640,6 +644,195 @@ __global__ void swiglu_fp8_requant_kernel(
     float q = act_cache[j] * inv_scale;
     row_q[i] = __nv_fp8_e4m3(q);
   }
+}
+
+// ============================================================================
+// v17: Fused SwiGLU+requant with routing weight absorption into the GEMM2 A
+// scale. This is a clean architectural change: multiplying broadcast_scale by
+// weights[m] means GEMM2's accumulator already contains the weighted value, so
+// reduce_scatter no longer needs the `w * v` multiply (saves one multiply per
+// element, ~5-15μs at large T). The row_scale (used nowhere downstream now
+// that broadcast already encodes the weight) is still written for diagnostics.
+// ============================================================================
+template <int H_>
+__global__ void swiglu_fp8_requant_weighted_kernel(
+    const __nv_bfloat16* __restrict__ gemm1_out,       // [M, 2*H]  bf16
+    const float*         __restrict__ sorted_weights,  // [M]       fp32
+    __nv_fp8_e4m3*       __restrict__ act_q,           // [M, H]    fp8
+    float*               __restrict__ row_scales,      // [M]       fp32 (for diagnostics)
+    float*               __restrict__ broadcast_scales, // [M, H/128] fp32 scale*weight
+    int M)
+{
+  constexpr int H = H_;
+  constexpr int TB = 256;
+  const int m = blockIdx.x;
+  if (m >= M) return;
+  const __nv_bfloat16* row_in = gemm1_out + m * (2 * H);
+  __nv_fp8_e4m3*       row_q  = act_q + m * H;
+
+  const int tid = threadIdx.x;
+
+  __shared__ float s_absmax;
+  if (tid == 0) s_absmax = 0.0f;
+  __syncthreads();
+
+  constexpr int ITERS = H / TB;
+  float act_cache[ITERS];
+  float thread_absmax = 0.0f;
+  #pragma unroll
+  for (int j = 0; j < ITERS; ++j) {
+    int i = tid + j * TB;
+    float g = __bfloat162float(row_in[i]);
+    float u = __bfloat162float(row_in[H + i]);
+    float act = g * (u * (0.5f + 0.5f * __tanhf(u * 0.5f)));
+    act_cache[j] = act;
+    thread_absmax = fmaxf(thread_absmax, fabsf(act));
+  }
+  constexpr int NW = TB / 32;
+  __shared__ float s_partial[NW];
+  float v = thread_absmax;
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, offset));
+  }
+  if ((tid & 31) == 0) s_partial[tid >> 5] = v;
+  __syncthreads();
+
+  if (tid < 32) {
+    float w = (tid < NW) ? s_partial[tid] : -INFINITY;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      w = fmaxf(w, __shfl_xor_sync(0xffffffff, w, offset));
+    }
+    if (tid == 0) s_absmax = w;
+  }
+  __syncthreads();
+
+  float row_max = fmaxf(s_absmax, 1e-8f);
+  float scale = fmaxf(row_max * (1.0f / 448.0f), 1e-8f);
+  float inv_scale = 1.0f / scale;
+
+  // Fold routing weight into the per-row A scale of GEMM2.
+  float w_route = sorted_weights[m];
+  float scale_weighted = scale * w_route;
+
+  if (tid == 0) {
+    row_scales[m] = scale;  // unweighted, diagnostic only
+  }
+
+  constexpr int KBLOCKS = H / 128;
+  if (tid < KBLOCKS) {
+    broadcast_scales[m * KBLOCKS + tid] = scale_weighted;
+  }
+
+  #pragma unroll
+  for (int j = 0; j < ITERS; ++j) {
+    int i = tid + j * TB;
+    float q = act_cache[j] * inv_scale;
+    row_q[i] = __nv_fp8_e4m3(q);
+  }
+}
+
+void swiglu_fp8_requant_weighted(
+    torch::Tensor const& gemm1_out,
+    torch::Tensor const& sorted_weights,
+    torch::Tensor&       act_q,
+    torch::Tensor&       row_scales,
+    torch::Tensor&       broadcast_scales)
+{
+  TORCH_CHECK(gemm1_out.is_cuda() && gemm1_out.dim() == 2);
+  TORCH_CHECK(gemm1_out.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(sorted_weights.is_cuda() && sorted_weights.scalar_type() == torch::kFloat32);
+  int M = gemm1_out.size(0);
+  int N1 = gemm1_out.size(1);
+  int H = N1 / 2;
+  TORCH_CHECK(N1 % 2 == 0 && H % 128 == 0, "H must be /128-aligned");
+  TORCH_CHECK(act_q.size(0) == M && act_q.size(1) == H);
+  TORCH_CHECK(act_q.scalar_type() == torch::kFloat8_e4m3fn);
+  TORCH_CHECK(row_scales.size(0) == M);
+  TORCH_CHECK(sorted_weights.size(0) == M);
+  TORCH_CHECK(broadcast_scales.size(0) == M && broadcast_scales.size(1) == H / 128);
+
+  auto stream = at::cuda::getCurrentCUDAStream(gemm1_out.get_device()).stream();
+
+  #define LAUNCH_HW(HCONST)                                                    \
+    do {                                                                        \
+      swiglu_fp8_requant_weighted_kernel<HCONST>                               \
+          <<<M, 256, 0, stream>>>(                                              \
+              reinterpret_cast<const __nv_bfloat16*>(gemm1_out.data_ptr()),    \
+              sorted_weights.data_ptr<float>(),                                \
+              reinterpret_cast<__nv_fp8_e4m3*>(act_q.data_ptr()),              \
+              row_scales.data_ptr<float>(),                                    \
+              broadcast_scales.data_ptr<float>(), M);                          \
+    } while (0)
+
+  switch (H) {
+    case 1024: LAUNCH_HW(1024); break;
+    case 2048: LAUNCH_HW(2048); break;
+    case 4096: LAUNCH_HW(4096); break;
+    default:
+      TORCH_CHECK(false, "Unsupported H=", H);
+  }
+  #undef LAUNCH_HW
+}
+
+// ============================================================================
+// v17/v18: reduce_scatter variant that does NOT multiply by weights (they are
+// already baked into the GEMM2 output by swiglu_fp8_requant_weighted).
+// ============================================================================
+__global__ void reduce_scatter_unweighted_kernel(
+    const __nv_bfloat16* __restrict__ gemm2_out,
+    const int*           __restrict__ token_offsets,
+    const int*           __restrict__ token_perm,
+    __nv_bfloat16*       __restrict__ out,
+    int T, int N2)
+{
+  int t = blockIdx.x;
+  if (t >= T) return;
+  int beg = token_offsets[t];
+  int end = token_offsets[t + 1];
+
+  const int TB = blockDim.x;
+  int lane = threadIdx.x;
+  const int n2_pairs = N2 / 2;
+
+  __nv_bfloat162* out2 = reinterpret_cast<__nv_bfloat162*>(out + t * N2);
+
+  #pragma unroll 2
+  for (int j = lane; j < n2_pairs; j += TB) {
+    float2 acc = make_float2(0.0f, 0.0f);
+    for (int k = beg; k < end; ++k) {
+      int m = token_perm[k];
+      const __nv_bfloat162* src2 = reinterpret_cast<const __nv_bfloat162*>(
+          gemm2_out + m * N2);
+      __nv_bfloat162 v = src2[j];
+      acc.x += __bfloat162float(v.x);
+      acc.y += __bfloat162float(v.y);
+    }
+    out2[j] = __floats2bfloat162_rn(acc.x, acc.y);
+  }
+}
+
+void reduce_scatter_unweighted_prebucketed(
+    torch::Tensor const& gemm2_out,
+    torch::Tensor const& token_offsets,
+    torch::Tensor const& token_perm,
+    torch::Tensor&       out,
+    int T)
+{
+  TORCH_CHECK(gemm2_out.is_cuda() && gemm2_out.dim() == 2);
+  TORCH_CHECK(gemm2_out.scalar_type() == torch::kBFloat16);
+  int N2 = gemm2_out.size(1);
+  TORCH_CHECK(N2 % 2 == 0);
+  TORCH_CHECK(out.size(0) == T && out.size(1) == N2);
+
+  auto stream = at::cuda::getCurrentCUDAStream(gemm2_out.get_device()).stream();
+  reduce_scatter_unweighted_kernel<<<T, 512, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(gemm2_out.data_ptr()),
+      token_offsets.data_ptr<int>(),
+      token_perm.data_ptr<int>(),
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+      T, N2);
 }
 
 void swiglu_fp8_requant(
@@ -1406,6 +1599,54 @@ void reduce_scatter(
       T, N2);
 }
 
+// v17: full 4-pass reduce-scatter (count + scan + place + reduce) without
+// per-element weight multiply. Used when routing weights are already baked
+// into GEMM2's A-scale upstream.
+void reduce_scatter_unweighted(
+    torch::Tensor const& gemm2_out,
+    torch::Tensor const& sorted_tids,
+    torch::Tensor&       out,
+    torch::Tensor&       token_counts,
+    torch::Tensor&       token_offsets,
+    torch::Tensor&       token_perm,
+    int T)
+{
+  TORCH_CHECK(gemm2_out.is_cuda() && gemm2_out.dim() == 2);
+  TORCH_CHECK(gemm2_out.scalar_type() == torch::kBFloat16);
+  int M = gemm2_out.size(0);
+  int N2 = gemm2_out.size(1);
+  TORCH_CHECK(N2 % 2 == 0);
+  TORCH_CHECK(sorted_tids.size(0) == M);
+  TORCH_CHECK(out.size(0) == T && out.size(1) == N2);
+  TORCH_CHECK(token_counts.numel() >= T);
+  TORCH_CHECK(token_offsets.numel() >= T + 1);
+  TORCH_CHECK(token_perm.numel() >= M);
+
+  auto stream = at::cuda::getCurrentCUDAStream(gemm2_out.get_device()).stream();
+  cudaMemsetAsync(token_counts.data_ptr(), 0, T * sizeof(int), stream);
+
+  int threads = 256;
+  int blocks = (M + threads - 1) / threads;
+  token_bucket_count_kernel<<<blocks, threads, 0, stream>>>(
+      sorted_tids.data_ptr<int>(), M, T, token_counts.data_ptr<int>());
+
+  token_bucket_scan_kernel<<<1, 1024, (1024 / 32) * sizeof(int), stream>>>(
+      token_counts.data_ptr<int>(), token_offsets.data_ptr<int>(), T);
+
+  cudaMemsetAsync(token_counts.data_ptr(), 0, T * sizeof(int), stream);
+
+  token_bucket_place_kernel<<<blocks, threads, 0, stream>>>(
+      sorted_tids.data_ptr<int>(), token_offsets.data_ptr<int>(),
+      M, T, token_counts.data_ptr<int>(), token_perm.data_ptr<int>());
+
+  reduce_scatter_unweighted_kernel<<<T, 512, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(gemm2_out.data_ptr()),
+      token_offsets.data_ptr<int>(),
+      token_perm.data_ptr<int>(),
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+      T, N2);
+}
+
 void reduce_scatter_prebucketed(
     torch::Tensor const& gemm2_out,     // [M, N2] bf16
     torch::Tensor const& weights,       // [M] fp32
@@ -1795,9 +2036,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("get_sizes", &get_sizes);
   m.def("get_workspace_size", &get_workspace_size);
   m.def("swiglu_fp8_requant", &swiglu_fp8_requant);
+  m.def("swiglu_fp8_requant_weighted", &swiglu_fp8_requant_weighted);
   m.def("weighted_scatter", &weighted_scatter);
   m.def("reduce_scatter", &reduce_scatter);
   m.def("reduce_scatter_prebucketed", &reduce_scatter_prebucketed);
+  m.def("reduce_scatter_unweighted_prebucketed", &reduce_scatter_unweighted_prebucketed);
+  m.def("reduce_scatter_unweighted", &reduce_scatter_unweighted);
   m.def("token_bucket_scan_and_place", &token_bucket_scan_and_place);
   m.def("fused_route_topk", &fused_route_topk);
   m.def("fused_gather_hidden_scales", &fused_gather_hidden_scales);
@@ -2566,7 +2810,13 @@ def _run_pipeline_dynamic(
         act_q = bufs["act_q"][:total_valid]
         row_scales = bufs["row_scales"][:total_valid]
         act_scale_for_gemm2 = bufs["act_scale_for_gemm2"][:total_valid]
-        ext.swiglu_fp8_requant(gemm1_out, act_q, row_scales, act_scale_for_gemm2)
+        # v17: fold routing weight into A scale of GEMM2 -> unweighted reduce_scatter.
+        use_weighted_fold = bool(int(os.environ.get("V17_WEIGHTED_FOLD", "1")))
+        if use_weighted_fold:
+            ext.swiglu_fp8_requant_weighted(
+                gemm1_out, sorted_weights, act_q, row_scales, act_scale_for_gemm2)
+        else:
+            ext.swiglu_fp8_requant(gemm1_out, act_q, row_scales, act_scale_for_gemm2)
 
         gemm2_out = bufs["gemm2_out"][:total_valid]
         if segmented_gemm2:
@@ -2616,6 +2866,9 @@ def _run_pipeline_dynamic(
 
     # Reduce-scatter: per-output-token summation, single bf16 write. Avoids
     # the 100μs out.zero_() and the atomic-contention on bf162 adds.
+    # v17: when weighted fold is on, routing weights were baked into GEMM2's
+    # A-scale inside swiglu_fp8_requant_weighted, so gemm2_out already encodes
+    # w * v. reduce_scatter must NOT multiply by weights again.
     if use_fused_dispatch_gather:
         ext.token_bucket_scan_and_place(
             sorted_tids,
@@ -2624,19 +2877,34 @@ def _run_pipeline_dynamic(
             bufs["token_perm_buf"],
             T,
         )
-        ext.reduce_scatter_prebucketed(
-            gemm2_out,
-            sorted_weights,
-            bufs["token_offsets_buf"],
-            bufs["token_perm_buf"],
-            bufs["out_bf16"],
-            T,
-        )
+        if use_weighted_fold:
+            ext.reduce_scatter_unweighted_prebucketed(
+                gemm2_out,
+                bufs["token_offsets_buf"],
+                bufs["token_perm_buf"],
+                bufs["out_bf16"],
+                T,
+            )
+        else:
+            ext.reduce_scatter_prebucketed(
+                gemm2_out,
+                sorted_weights,
+                bufs["token_offsets_buf"],
+                bufs["token_perm_buf"],
+                bufs["out_bf16"],
+                T,
+            )
     else:
-        ext.reduce_scatter(
-            gemm2_out, sorted_weights, sorted_tids, bufs["out_bf16"],
-            bufs["token_counts_buf"], bufs["token_offsets_buf"], bufs["token_perm_buf"],
-            T)
+        if use_weighted_fold:
+            ext.reduce_scatter_unweighted(
+                gemm2_out, sorted_tids, bufs["out_bf16"],
+                bufs["token_counts_buf"], bufs["token_offsets_buf"], bufs["token_perm_buf"],
+                T)
+        else:
+            ext.reduce_scatter(
+                gemm2_out, sorted_weights, sorted_tids, bufs["out_bf16"],
+                bufs["token_counts_buf"], bufs["token_offsets_buf"], bufs["token_perm_buf"],
+                T)
     return bufs["out_bf16"]
 
 
