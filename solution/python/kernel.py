@@ -133,6 +133,26 @@ struct CfgVeryLargeM {
 };
 
 // ============================================================================
+// v18 (ceiling-breaker): MxF8F6F4 hardware block-scale MMA config.
+// Uses tcgen05.mma.kind.mxf8f6f4.block_scale with UE8M0 scales at sf_vec_size=32.
+// Requires inputs to be transcoded: sign-flip + residual absorbed into payload
+// (done upstream in a dedicated transcode kernel).
+// ============================================================================
+struct CfgMxF8Large {
+  using MmaTileShape = Shape<_128, _128, _128>;
+  using ClusterShape = Shape<_1, _1, _1>;
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmMxf8f6f4Sm100;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm;
+};
+
+struct CfgMxF8VeryLarge {
+  using MmaTileShape = Shape<_256, _128, _128>;
+  using ClusterShape = Shape<_2, _1, _1>;
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmMxf8f6f4Sm100;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm;
+};
+
+// ============================================================================
 // Build the CUTLASS Gemm type from a config
 // ============================================================================
 using ElementAB = cutlass::float_e4m3_t;
@@ -143,6 +163,11 @@ using LayoutB = cutlass::layout::ColumnMajor;
 constexpr int AlignmentA = 16;  // 128bits / 8 = 16 fp8 elements
 constexpr int AlignmentB = 16;
 constexpr int AlignmentC = 8;   // 128bits / 16 = 8 bf16 elements
+
+// MxF8 operand types: wrap FP8 E4M3 with MxF8 tag so CUTLASS selects the
+// hardware block-scale MMA path.
+using ElementAB_mx = cutlass::mx_float8_t<ElementAB>;
+using ElementSF_mx = cutlass::float_ue8m0_t;  // 8-bit exponent-only scale type
 
 template <typename Cfg, typename LayoutOut>
 struct GemmBuilder {
@@ -478,6 +503,179 @@ void moe_blockwise_grouped_mm_v2(
   }
 }
 
+// ============================================================================
+// v18: MxF8 path — transcode kernels.
+//
+// Transcode: (payload_fp8, signed_fp32_scale) per K-128-block -> (payload'_fp8, |scale|_fp32).
+//   payload'[i] = sign(scale[block(i)]) * round_fp8(payload[i] * r[block(i)])
+//   where r = |scale| / ceil_pow2(|scale|), in (0.5, 1.0].
+// |scale| is then passed to CUTLASS MxF8 which internally converts to UE8M0
+// via `float_ue8m0_t(float)` (ceil-to-pow2).
+// ============================================================================
+__device__ __forceinline__ uint8_t ue8m0_ceil_from_abs_fp32(float x) {
+  // Ceil to pow-of-2; returns the UE8M0 exponent byte (8-bit bias 0; value 2^(byte-127)).
+  // Actually UE8M0 encodes exponent in [-127, 127] directly via the 8-bit field
+  // where `byte` = ieee32_exponent + rounding_increment.
+  // For ceil: if mantissa > 0 and not max exponent, increment exponent.
+  if (!isfinite(x) || x <= 0.0f) return 0;
+  uint32_t bits = __float_as_uint(x);
+  uint8_t exp = (bits >> 23) & 0xff;  // IEEE-32 exponent (biased)
+  uint32_t mant = bits & 0x7fffff;
+  if (mant > 0 && exp != 0xFE) exp++;
+  return exp;
+}
+
+__device__ __forceinline__ float ue8m0_byte_to_fp32(uint8_t b) {
+  uint32_t f = (uint32_t)(b) << 23;
+  return __uint_as_float(f);
+}
+
+// Transcode kernel, GENERIC layout for A-side (activations) or B-side (weights).
+// Input layout: payload is [..., K] fp8 E4M3; scale is per-128 K-block signed fp32.
+// - For activations: payload [M, K] row-major, scale [M, K/128] row-major (kb-fast).
+// - For weights:      payload [E, N, K] row-major, scale [E, N/128, K/128] row-major.
+// Output:
+// - payload': overwrite payload in place (sign-flip + residual absorption).
+// - scale_abs: fp32 buffer with |scale| values (same shape as input scale). CUTLASS
+//              converts these to UE8M0 internally via `ElementSF(float)` which ceils.
+//   Output size same as input scale.
+__global__ void mxf8_transcode_kernel(
+    __nv_fp8_e4m3*       __restrict__ payload,  // in/out, size N_pay = M * K
+    const float*         __restrict__ scale_signed,  // in, size N_sc = M * K/128 (contiguous)
+    float*               __restrict__ scale_ue8m0,  // out: ue8m0 as fp32 (pow-of-2)
+    int                   M,                        // leading dim (rows)
+    int                   K,                        // K
+    int                   K_blocks,                 // = K/128
+    int                   payload_row_stride,       // = K for contiguous row-major
+    int                   scale_row_stride          // = K_blocks for contiguous
+) {
+  // Grid: (M * K_blocks) blocks; each block handles one 128-element sub-row.
+  int m = blockIdx.y;
+  int kb = blockIdx.x;
+  if (m >= M || kb >= K_blocks) return;
+
+  int tid = threadIdx.x;
+  int scale_idx = m * scale_row_stride + kb;
+  float s_signed = scale_signed[scale_idx];
+  float s_abs = fabsf(s_signed);
+  float sign = (s_signed < 0.0f) ? -1.0f : 1.0f;
+
+  // Ceil to pow-of-2.
+  uint8_t ue8m0_byte = ue8m0_ceil_from_abs_fp32(s_abs);
+  float ue8m0_val = ue8m0_byte_to_fp32(ue8m0_byte);
+
+  // Write ue8m0 (fp32 power-of-2 value) as the scale. This is the value that
+  // MxF8 hardware uses and also the value that our FP32-blockwise kernel
+  // uses as stand-in. `r = |scale|/ue8m0` is absorbed into the payload below.
+  if (tid == 0) {
+    scale_ue8m0[scale_idx] = ue8m0_val;
+  }
+
+  float r = (ue8m0_val > 0.0f) ? (s_abs / ue8m0_val) : 1.0f;
+  float sr = sign * r;
+
+  // Transcode payload: 128 FP8 elements per warp block.
+  __nv_fp8_e4m3* row = payload + m * payload_row_stride + kb * 128;
+  // 128 threads each handle 1 element (if blockDim.x==128). If smaller, stride.
+  int TB = blockDim.x;
+  for (int j = tid; j < 128; j += TB) {
+    float v = (float)row[j];
+    float vn = v * sr;
+    // Clamp to FP8 E4M3 range to avoid NaN on overflow.
+    if (vn > 448.0f) vn = 448.0f;
+    if (vn < -448.0f) vn = -448.0f;
+    row[j] = __nv_fp8_e4m3(vn);
+  }
+}
+
+// Host wrappers for transcoding activations and weights.
+void mxf8_transcode_activations(
+    torch::Tensor& payload,         // [M, K] fp8 (in/out)
+    torch::Tensor const& scale,     // [M, K/128] fp32 signed (in)
+    torch::Tensor& scale_ue8m0      // [M, K/128] fp32 (out), holds pow-of-2 values
+) {
+  TORCH_CHECK(payload.is_cuda() && payload.scalar_type() == torch::kFloat8_e4m3fn);
+  TORCH_CHECK(scale.is_cuda() && scale.scalar_type() == torch::kFloat32);
+  int M = payload.size(0);
+  int K = payload.size(1);
+  int K_blocks = scale.size(1);
+  TORCH_CHECK(K_blocks == K / 128, "scale K/128 mismatch");
+  TORCH_CHECK(scale.size(0) == M, "scale M mismatch");
+
+  auto stream = at::cuda::getCurrentCUDAStream(payload.get_device()).stream();
+  dim3 grid(K_blocks, M);
+  mxf8_transcode_kernel<<<grid, 128, 0, stream>>>(
+      reinterpret_cast<__nv_fp8_e4m3*>(payload.data_ptr()),
+      scale.data_ptr<float>(),
+      scale_ue8m0.data_ptr<float>(),
+      M, K, K_blocks,
+      payload.stride(0),   // payload row stride
+      scale.stride(0));    // scale row stride
+}
+
+// Dedicated weight-transcode kernel: per-expert, per-output-row, per-k-block.
+__global__ void mxf8_transcode_weight_kernel(
+    __nv_fp8_e4m3*       __restrict__ payload,  // [E, N, K] fp8 (in/out)
+    const float*         __restrict__ scale_signed,  // [E, N/128, K/128] fp32
+    float*               __restrict__ scale_ue8m0,   // [E, N/128, K/128] fp32 (out, pow-of-2)
+    int E, int N, int K, int N_blocks, int K_blocks
+) {
+  int kb = blockIdx.x;
+  int n = blockIdx.y;
+  int e = blockIdx.z;
+  if (kb >= K_blocks || n >= N || e >= E) return;
+  int nb = n / 128;
+  int tid = threadIdx.x;
+
+  int scale_idx = (e * N_blocks + nb) * K_blocks + kb;
+  float s_signed = scale_signed[scale_idx];
+  float s_abs = fabsf(s_signed);
+  float sign = (s_signed < 0.0f) ? -1.0f : 1.0f;
+
+  uint8_t ue8m0_byte = ue8m0_ceil_from_abs_fp32(s_abs);
+  float ue8m0_val = ue8m0_byte_to_fp32(ue8m0_byte);
+
+  // Only ONE thread in the FIRST n of each nb-row writes scale_ue8m0 (dedup).
+  if (tid == 0 && (n % 128) == 0) {
+    scale_ue8m0[scale_idx] = ue8m0_val;
+  }
+
+  float r = (ue8m0_val > 0.0f) ? (s_abs / ue8m0_val) : 1.0f;
+  float sr = sign * r;
+
+  __nv_fp8_e4m3* row = payload + ((e * (int64_t)N + n) * (int64_t)K) + kb * 128;
+  int TB = blockDim.x;
+  for (int j = tid; j < 128; j += TB) {
+    float v = (float)row[j];
+    float vn = v * sr;
+    if (vn > 448.0f) vn = 448.0f;
+    if (vn < -448.0f) vn = -448.0f;
+    row[j] = __nv_fp8_e4m3(vn);
+  }
+}
+
+void mxf8_transcode_weights_impl(
+    torch::Tensor& payload,         // [E, N, K] fp8 (in/out)
+    torch::Tensor const& scale,     // [E, N/128, K/128] fp32 signed (in)
+    torch::Tensor& scale_ue8m0      // [E, N/128, K/128] fp32 (out, pow-of-2)
+) {
+  TORCH_CHECK(payload.is_cuda() && payload.scalar_type() == torch::kFloat8_e4m3fn);
+  TORCH_CHECK(scale.is_cuda() && scale.scalar_type() == torch::kFloat32);
+  int E = payload.size(0);
+  int N = payload.size(1);
+  int K = payload.size(2);
+  int N_blocks = scale.size(1);
+  int K_blocks = scale.size(2);
+
+  auto stream = at::cuda::getCurrentCUDAStream(payload.get_device()).stream();
+  dim3 grid(K_blocks, N, E);
+  mxf8_transcode_weight_kernel<<<grid, 128, 0, stream>>>(
+      reinterpret_cast<__nv_fp8_e4m3*>(payload.data_ptr()),
+      scale.data_ptr<float>(),
+      scale_ue8m0.data_ptr<float>(),
+      E, N, K, N_blocks, K_blocks);
+}
+
 // Expose sizeof() info for Python to size workspace tensors correctly.
 // We use max across configs to be safe. Stride/Layout types are the same across
 // configs since they only differ by template-static numeric params.
@@ -546,6 +744,10 @@ void moe_blockwise_grouped_mm_v2(
 
 std::tuple<int64_t, int64_t, int64_t> get_sizes();
 int64_t get_workspace_size(int max_total_tokens, int E, int N, int K, bool use_small_m);
+
+// v18 MxF8 transcode forward decls.
+void mxf8_transcode_activations(torch::Tensor& payload, torch::Tensor const& scale, torch::Tensor& scale_abs);
+void mxf8_transcode_weights_impl(torch::Tensor& payload, torch::Tensor const& scale, torch::Tensor& scale_abs);
 
 // ============================================================================
 // Fused SwiGLU + per-row FP8 requant kernel.
@@ -2068,6 +2270,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("repack_aligned_expert_layout", &repack_aligned_expert_layout);
   m.def("fused_dispatch", &fused_dispatch);
   m.def("fused_dispatch_gather_hidden_scales", &fused_dispatch_gather_hidden_scales);
+  m.def("mxf8_transcode_activations", &mxf8_transcode_activations);
+  m.def("mxf8_transcode_weights_impl", &mxf8_transcode_weights_impl);
 }
 '''
 
