@@ -166,8 +166,173 @@ constexpr int AlignmentC = 8;   // 128bits / 16 = 8 bf16 elements
 
 // MxF8 operand types: wrap FP8 E4M3 with MxF8 tag so CUTLASS selects the
 // hardware block-scale MMA path.
-using ElementAB_mx = cutlass::mx_float8_t<ElementAB>;
 using ElementSF_mx = cutlass::float_ue8m0_t;  // 8-bit exponent-only scale type
+using MmaTypePairA = decltype(cute::make_tuple(ElementAB{}, ElementSF_mx{}));
+using MmaTypePairB = decltype(cute::make_tuple(ElementAB{}, ElementSF_mx{}));
+
+// ============================================================================
+// MxF8 GemmBuilder: uses hardware block-scale MMA schedule with UE8M0 scales
+// at SFVecSize=32. Requires transcoded inputs (see mxf8_transcode_*).
+// ============================================================================
+template <typename Cfg, typename LayoutOut>
+struct MxF8GemmBuilder {
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
+      typename Cfg::MmaTileShape, typename Cfg::ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAccumulator, ElementAccumulator,
+      void, LayoutOut*, AlignmentC,
+      ElementC, LayoutOut*, AlignmentC,
+      typename Cfg::EpilogueSchedule>::CollectiveOp;
+
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      cutlass::arch::Sm100, cutlass::arch::OpClassBlockScaledTensorOp,
+      MmaTypePairA, LayoutA*, AlignmentA,
+      MmaTypePairB, LayoutB*, AlignmentB,
+      ElementAccumulator,
+      typename Cfg::MmaTileShape, typename Cfg::ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<
+          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      typename Cfg::KernelSchedule>::CollectiveOp;
+
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      ProblemShape, CollectiveMainloop, CollectiveEpilogue, void>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  using StrideA = typename Gemm::GemmKernel::InternalStrideA;
+  using StrideB = typename Gemm::GemmKernel::InternalStrideB;
+  using StrideC = typename Gemm::GemmKernel::InternalStrideC;
+  using StrideD = typename Gemm::GemmKernel::InternalStrideD;
+  using InternalLayoutSFA = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFA;
+  using InternalLayoutSFB = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFB;
+  using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+  static constexpr int SFVecSize = Gemm::GemmKernel::CollectiveMainloop::SFVecSize;
+};
+
+// MxF8 per-expert starts kernel: fills ptr arrays, strides, and SFA/SFB
+// layouts for ptr-array MxF8 grouped GEMM.
+template <typename Cfg, typename LayoutOut>
+__global__ void get_group_gemm_starts_kernel_mxf8(
+    int32_t const* __restrict__ expert_offsets,  // [E]
+    int32_t const* __restrict__ sfa_offsets,     // [E+1] cumulative SFA byte offsets
+    int32_t const* __restrict__ sfb_offsets,     // [E+1] cumulative SFB byte offsets
+    ElementAB** a_ptrs,
+    ElementAB** b_ptrs,
+    ElementC** out_ptrs,
+    ElementSF_mx** sfa_ptrs,
+    ElementSF_mx** sfb_ptrs,
+    ElementAB* a_base,
+    ElementAB* b_base,
+    ElementC* out_base,
+    ElementSF_mx* sfa_base,
+    ElementSF_mx* sfb_base,
+    typename MxF8GemmBuilder<Cfg, LayoutOut>::InternalLayoutSFA* layout_sfa_base,
+    typename MxF8GemmBuilder<Cfg, LayoutOut>::InternalLayoutSFB* layout_sfb_base,
+    typename MxF8GemmBuilder<Cfg, LayoutOut>::StrideA* stride_a_base,
+    typename MxF8GemmBuilder<Cfg, LayoutOut>::StrideB* stride_b_base,
+    typename MxF8GemmBuilder<Cfg, LayoutOut>::StrideC* stride_c_base,
+    int32_t const* problem_sizes)                // [E, 3]
+{
+  using MxFB = MxF8GemmBuilder<Cfg, LayoutOut>;
+  using SfConfig = typename MxFB::Sm1xxBlkScaledConfig;
+
+  int eid = threadIdx.x;
+  int m_e = problem_sizes[eid * 3];
+  int n_e = problem_sizes[eid * 3 + 1];
+  int k_e = problem_sizes[eid * 3 + 2];
+
+  int64_t expert_offset = static_cast<int64_t>(expert_offsets[eid]);
+  int64_t a_stride       = expert_offset * k_e;
+  int64_t b_stride       = int64_t(eid) * int64_t(k_e) * int64_t(n_e);
+
+  a_ptrs[eid]         = a_base + a_stride;
+  b_ptrs[eid]         = b_base + b_stride;
+  out_ptrs[eid]       = out_base + expert_offset * n_e;
+
+  sfa_ptrs[eid] = sfa_base + sfa_offsets[eid];
+  sfb_ptrs[eid] = sfb_base + sfb_offsets[eid];
+
+  layout_sfa_base[eid] = SfConfig::tile_atom_to_shape_SFA(
+      cute::make_shape(m_e, n_e, k_e, 1));
+  layout_sfb_base[eid] = SfConfig::tile_atom_to_shape_SFB(
+      cute::make_shape(m_e, n_e, k_e, 1));
+
+  stride_a_base[eid] = cutlass::make_cute_packed_stride(
+      typename MxFB::StrideA{}, cute::make_shape(m_e, k_e, 1));
+  stride_b_base[eid] = cutlass::make_cute_packed_stride(
+      typename MxFB::StrideB{}, cute::make_shape(n_e, k_e, 1));
+  stride_c_base[eid] = cutlass::make_cute_packed_stride(
+      typename MxFB::StrideC{}, cute::make_shape(m_e, n_e, 1));
+}
+
+template <typename Cfg, typename LayoutOut>
+void launch_mxf8_group_gemm(
+    torch::Tensor& a_ptrs,
+    torch::Tensor& b_ptrs,
+    torch::Tensor& out_ptrs,
+    torch::Tensor& sfa_ptrs,
+    torch::Tensor& sfb_ptrs,
+    torch::Tensor const& stride_a,
+    torch::Tensor const& stride_b,
+    torch::Tensor const& stride_c,
+    torch::Tensor const& layout_sfa,
+    torch::Tensor const& layout_sfb,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor const& workspace,
+    int num_experts,
+    cudaStream_t stream)
+{
+  using MxFB = MxF8GemmBuilder<Cfg, LayoutOut>;
+  using Gemm = typename MxFB::Gemm;
+  using UnderlyingProblemShape = typename ProblemShape::UnderlyingProblemShape;
+
+  typename Gemm::GemmKernel::MainloopArguments mainloop_args{
+      static_cast<const ElementAB**>(a_ptrs.data_ptr()),
+      static_cast<typename MxFB::StrideA*>(const_cast<void*>(stride_a.data_ptr())),
+      static_cast<const ElementAB**>(b_ptrs.data_ptr()),
+      static_cast<typename MxFB::StrideB*>(const_cast<void*>(stride_b.data_ptr())),
+      static_cast<const ElementSF_mx**>(sfa_ptrs.data_ptr()),
+      reinterpret_cast<typename MxFB::InternalLayoutSFA*>(const_cast<void*>(layout_sfa.data_ptr())),
+      static_cast<const ElementSF_mx**>(sfb_ptrs.data_ptr()),
+      reinterpret_cast<typename MxFB::InternalLayoutSFB*>(const_cast<void*>(layout_sfb.data_ptr()))
+  };
+
+  typename Gemm::GemmKernel::EpilogueArguments epilogue_args{
+      {},
+      nullptr,
+      static_cast<typename MxFB::StrideC*>(const_cast<void*>(stride_c.data_ptr())),
+      static_cast<ElementC**>(out_ptrs.data_ptr()),
+      static_cast<typename MxFB::StrideC*>(const_cast<void*>(stride_c.data_ptr()))
+  };
+
+  cutlass::KernelHardwareInfo hw_info;
+  hw_info.device_id = c10::cuda::current_device();
+  hw_info.sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+
+  typename Gemm::GemmKernel::TileSchedulerArguments scheduler{};
+  scheduler.raster_order = cutlass::gemm::kernel::detail::RasterOrderOptions::AlongM;
+  scheduler.max_swizzle_size = 1;
+
+  auto* ps = static_cast<UnderlyingProblemShape*>(const_cast<void*>(problem_sizes.data_ptr()));
+  typename Gemm::GemmKernel::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGrouped,
+      {num_experts, ps, nullptr},
+      mainloop_args,
+      epilogue_args,
+      hw_info,
+      scheduler
+  };
+  auto& fusion_args = args.epilogue.thread;
+  fusion_args.alpha = 1.0f;
+  fusion_args.beta = 0.0f;
+
+  Gemm gemm_op;
+  auto status = gemm_op.can_implement(args);
+  TORCH_CHECK(status == cutlass::Status::kSuccess, "MxF8 can_implement failed: ", int(status));
+  status = gemm_op.initialize(args, const_cast<void*>(workspace.data_ptr()), stream);
+  TORCH_CHECK(status == cutlass::Status::kSuccess, "MxF8 initialize failed: ", int(status));
+  status = gemm_op.run(stream);
+  TORCH_CHECK(status == cutlass::Status::kSuccess, "MxF8 run failed: ", int(status));
+}
 
 template <typename Cfg, typename LayoutOut>
 struct GemmBuilder {
@@ -676,6 +841,299 @@ void mxf8_transcode_weights_impl(
       E, N, K, N_blocks, K_blocks);
 }
 
+// ============================================================================
+// Helper: pack per-128-K-block fp32 pow-of-2 scales into the CUTLASS-expected
+// MxF8 UE8M0 byte layout for SFA (per-token) / SFB (per-128-row block).
+//
+// CUTLASS layout (SFVecSize=32, Blk_MN=128, Blk_SF=4) is produced by
+// `Sm1xxBlkScaledConfig<32>::tile_atom_to_shape_SFA({M, N, K, 1})`. We
+// compute the tile's element offset for each (m, k_32block) coordinate from
+// the runtime layout struct.
+//
+// To avoid needing the raw Layout-functor evaluation on device, we use a
+// pre-computed cache: for each expert we store the LAYOUT struct, then the
+// kernel evaluates the layout in-place (simple `layout(m, k, 0)` call).
+// ============================================================================
+template <typename Cfg, typename LayoutOut>
+__global__ void pack_sfa_per_expert_kernel(
+    const float* __restrict__ scale_fp32,      // [M, K/128] per-token pow2 fp32
+    const int* __restrict__ expert_offsets,     // [E]
+    const int* __restrict__ sfa_byte_offsets,   // [E+1]
+    typename MxF8GemmBuilder<Cfg, LayoutOut>::InternalLayoutSFA* layouts,  // [E]
+    typename MxF8GemmBuilder<Cfg, LayoutOut>::Sm1xxBlkScaledConfig::SfAtom sfatom,
+    int K,
+    int K_blocks_128,  // K/128
+    cutlass::float_ue8m0_t* sfa_out  // flat UE8M0 output, per-expert regions
+) {
+  using MxFB = MxF8GemmBuilder<Cfg, LayoutOut>;
+
+  int e  = blockIdx.z;
+  int m  = blockIdx.y;        // local m within expert
+  int kb = blockIdx.x;        // K-block-128 index
+  int tid = threadIdx.x;
+
+  // m_count = counts[e] = expert_offsets[e+1] - expert_offsets[e]
+  int expert_start = expert_offsets[e];
+  int next_start   = expert_offsets[e + 1];
+  int m_count = next_start - expert_start;
+  if (m >= m_count || kb >= K_blocks_128) return;
+
+  int global_m = expert_start + m;
+  float fp32_val = scale_fp32[global_m * K_blocks_128 + kb];  // pow2 value
+  uint8_t ue8m0_byte = ue8m0_ceil_from_abs_fp32(fp32_val);
+
+  // Per-expert sub-layout.
+  auto layout = layouts[e];
+  cutlass::float_ue8m0_t* out = sfa_out + sfa_byte_offsets[e];
+
+  // The 128-element K-block corresponds to 4 sub-blocks of 32 elements. Write
+  // the same UE8M0 byte at each of those 4 sub-block positions, at row m.
+  // Layout indexing: layout(m, k, 0) -> offset.
+  for (int sub = tid; sub < 4; sub += blockDim.x) {
+    int k = kb * 128 + sub * 32;
+    int off = layout(m, k, 0);
+    out[off] = cutlass::float_ue8m0_t::bitcast(ue8m0_byte);
+  }
+}
+
+// Similar for SFB (per-128-row blocks of N; per-32 K-sub-blocks).
+template <typename Cfg, typename LayoutOut>
+__global__ void pack_sfb_per_expert_kernel(
+    const float* __restrict__ scale_fp32,       // [E, N/128, K/128] per-row-block pow2 fp32
+    const int* __restrict__ sfb_byte_offsets,    // [E+1]
+    typename MxF8GemmBuilder<Cfg, LayoutOut>::InternalLayoutSFB* layouts,  // [E]
+    int E, int N, int K,
+    int N_blocks_128,
+    int K_blocks_128,
+    cutlass::float_ue8m0_t* sfb_out
+) {
+  int e  = blockIdx.z;
+  int n  = blockIdx.y;        // local n within expert
+  int kb = blockIdx.x;
+  int tid = threadIdx.x;
+
+  if (e >= E || n >= N || kb >= K_blocks_128) return;
+  int nb = n / 128;
+  float fp32_val = scale_fp32[(e * N_blocks_128 + nb) * K_blocks_128 + kb];
+  uint8_t ue8m0_byte = ue8m0_ceil_from_abs_fp32(fp32_val);
+
+  auto layout = layouts[e];
+  cutlass::float_ue8m0_t* out = sfb_out + sfb_byte_offsets[e];
+
+  for (int sub = tid; sub < 4; sub += blockDim.x) {
+    int k = kb * 128 + sub * 32;
+    int off = layout(n, k, 0);
+    out[off] = cutlass::float_ue8m0_t::bitcast(ue8m0_byte);
+  }
+}
+
+// ============================================================================
+// Main MxF8 MoE grouped GEMM entry. Same interface as moe_blockwise_grouped_mm_v2
+// but expects `scales_a`, `scales_b` to be POW-OF-2 fp32 values (from the
+// transcode kernel output). The payloads `a`, `b` must already be transcoded
+// in place (sign flip + residual absorbed). Caller must pre-compute
+// sfa_byte_offsets[E+1] and sfb_byte_offsets[E+1] based on problem_sizes[e]
+// and the per-expert layout size.
+// ============================================================================
+void moe_mxf8_grouped_mm(
+    torch::Tensor& output,           // [total_tokens, N] bf16
+    torch::Tensor const& a,          // [total_tokens, K] fp8 (transcoded)
+    torch::Tensor const& b,          // [E, N, K] fp8 (transcoded)
+    torch::Tensor const& scales_a,   // [total_tokens, K/128] fp32 pow-of-2
+    torch::Tensor const& scales_b,   // [E, N/128, K/128] fp32 pow-of-2
+    torch::Tensor const& expert_offsets,   // [E+1] int32 (inclusive scan; [0] = 0, [E] = total)
+    torch::Tensor const& problem_sizes,    // [E, 3] int32
+    torch::Tensor& a_ptrs,
+    torch::Tensor& b_ptrs,
+    torch::Tensor& out_ptrs,
+    torch::Tensor& sfa_ptrs,
+    torch::Tensor& sfb_ptrs,
+    torch::Tensor const& stride_a,
+    torch::Tensor const& stride_b,
+    torch::Tensor const& stride_c,
+    torch::Tensor& layout_sfa,
+    torch::Tensor& layout_sfb,
+    torch::Tensor& sfa_buffer,       // UE8M0 packed scales for A (flat)
+    torch::Tensor& sfb_buffer,       // UE8M0 packed scales for B (flat)
+    torch::Tensor const& sfa_byte_offsets,  // [E+1] int32
+    torch::Tensor const& sfb_byte_offsets,  // [E+1] int32
+    torch::Tensor const& workspace)
+{
+  int total_tokens = a.size(0);
+  int K = a.size(1);
+  int E = b.size(0);
+  int N = b.size(1);
+  TORCH_CHECK(b.size(2) == K, "b K mismatch");
+  TORCH_CHECK(output.size(0) == total_tokens && output.size(1) == N, "output shape mismatch");
+
+  using Cfg = CfgMxF8Large;
+  using LayoutOut = cutlass::layout::RowMajor;
+  using MxFB = MxF8GemmBuilder<Cfg, LayoutOut>;
+  using SfConfig = typename MxFB::Sm1xxBlkScaledConfig;
+
+  auto stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
+
+  // 1) Pack fp32 pow2 scales into UE8M0 layout per expert.
+  // SFA: per-token, SFB: per-128-row-block.
+  dim3 sfa_grid(K / 128, total_tokens / E + 1, E);  // over-approximates; kernel guards with m_count
+  // Cleaner: grid.y = max per-expert m across all experts; conservative pick total_tokens/E+1.
+  // For correctness we iterate m up to m_count inside the kernel.
+  // Use a single max(m_e) across experts: easier is to just launch total_tokens Y (upper bound of per-expert m).
+  int max_m_per_expert = 0;
+  {
+    auto ps_cpu = problem_sizes.cpu();
+    auto* p = ps_cpu.data_ptr<int32_t>();
+    for (int e = 0; e < E; ++e) max_m_per_expert = std::max(max_m_per_expert, p[e * 3]);
+  }
+  sfa_grid = dim3(K / 128, max_m_per_expert, E);
+  typename SfConfig::SfAtom sfatom{};
+  pack_sfa_per_expert_kernel<Cfg, LayoutOut><<<sfa_grid, 4, 0, stream>>>(
+      scales_a.data_ptr<float>(),
+      expert_offsets.data_ptr<int>(),
+      sfa_byte_offsets.data_ptr<int>(),
+      reinterpret_cast<typename MxFB::InternalLayoutSFA*>(layout_sfa.data_ptr()),
+      sfatom,
+      K, K / 128,
+      reinterpret_cast<cutlass::float_ue8m0_t*>(sfa_buffer.data_ptr()));
+
+  dim3 sfb_grid(K / 128, N, E);
+  pack_sfb_per_expert_kernel<Cfg, LayoutOut><<<sfb_grid, 4, 0, stream>>>(
+      scales_b.data_ptr<float>(),
+      sfb_byte_offsets.data_ptr<int>(),
+      reinterpret_cast<typename MxFB::InternalLayoutSFB*>(layout_sfb.data_ptr()),
+      E, N, K, N / 128, K / 128,
+      reinterpret_cast<cutlass::float_ue8m0_t*>(sfb_buffer.data_ptr()));
+
+  // 2) Build ptr arrays, strides, per-expert layouts.
+  get_group_gemm_starts_kernel_mxf8<Cfg, LayoutOut><<<1, E, 0, stream>>>(
+      expert_offsets.data_ptr<int>(),
+      sfa_byte_offsets.data_ptr<int>(),
+      sfb_byte_offsets.data_ptr<int>(),
+      static_cast<ElementAB**>(a_ptrs.data_ptr()),
+      static_cast<ElementAB**>(b_ptrs.data_ptr()),
+      static_cast<ElementC**>(out_ptrs.data_ptr()),
+      static_cast<ElementSF_mx**>(sfa_ptrs.data_ptr()),
+      static_cast<ElementSF_mx**>(sfb_ptrs.data_ptr()),
+      static_cast<ElementAB*>(const_cast<void*>(a.data_ptr())),
+      static_cast<ElementAB*>(const_cast<void*>(b.data_ptr())),
+      static_cast<ElementC*>(output.data_ptr()),
+      reinterpret_cast<ElementSF_mx*>(sfa_buffer.data_ptr()),
+      reinterpret_cast<ElementSF_mx*>(sfb_buffer.data_ptr()),
+      reinterpret_cast<typename MxFB::InternalLayoutSFA*>(layout_sfa.data_ptr()),
+      reinterpret_cast<typename MxFB::InternalLayoutSFB*>(layout_sfb.data_ptr()),
+      reinterpret_cast<typename MxFB::StrideA*>(const_cast<void*>(stride_a.data_ptr())),
+      reinterpret_cast<typename MxFB::StrideB*>(const_cast<void*>(stride_b.data_ptr())),
+      reinterpret_cast<typename MxFB::StrideC*>(const_cast<void*>(stride_c.data_ptr())),
+      problem_sizes.data_ptr<int>());
+
+  // 3) Launch CUTLASS MxF8 grouped GEMM.
+  launch_mxf8_group_gemm<Cfg, LayoutOut>(
+      a_ptrs, b_ptrs, out_ptrs, sfa_ptrs, sfb_ptrs,
+      stride_a, stride_b, stride_c,
+      layout_sfa, layout_sfb,
+      problem_sizes, workspace, E, stream);
+}
+
+// Helper: compute per-expert SFA buffer size (bytes = UE8M0 count) from
+// problem_sizes. Returns {cumulative_offsets[E+1], total_size_elems}.
+std::tuple<std::vector<int32_t>, int64_t>
+compute_mxf8_sfa_layout_offsets_host(torch::Tensor const& problem_sizes) {
+  using Cfg = CfgMxF8Large;
+  using LayoutOut = cutlass::layout::RowMajor;
+  using MxFB = MxF8GemmBuilder<Cfg, LayoutOut>;
+  using SfConfig = typename MxFB::Sm1xxBlkScaledConfig;
+
+  int E = problem_sizes.size(0);
+  auto ps_cpu = problem_sizes.cpu();
+  auto* p = ps_cpu.data_ptr<int32_t>();
+
+  std::vector<int32_t> offsets(E + 1, 0);
+  for (int e = 0; e < E; ++e) {
+    int m_e = p[e * 3];
+    int n_e = p[e * 3 + 1];
+    int k_e = p[e * 3 + 2];
+    auto layout_sfa = SfConfig::tile_atom_to_shape_SFA(cute::make_shape(m_e, n_e, k_e, 1));
+    int size_e = cute::size(cute::filter_zeros(layout_sfa));
+    offsets[e + 1] = offsets[e] + size_e;
+  }
+  return {offsets, offsets.back()};
+}
+
+std::tuple<std::vector<int32_t>, int64_t>
+compute_mxf8_sfb_layout_offsets_host(torch::Tensor const& problem_sizes) {
+  using Cfg = CfgMxF8Large;
+  using LayoutOut = cutlass::layout::RowMajor;
+  using MxFB = MxF8GemmBuilder<Cfg, LayoutOut>;
+  using SfConfig = typename MxFB::Sm1xxBlkScaledConfig;
+
+  int E = problem_sizes.size(0);
+  auto ps_cpu = problem_sizes.cpu();
+  auto* p = ps_cpu.data_ptr<int32_t>();
+
+  std::vector<int32_t> offsets(E + 1, 0);
+  for (int e = 0; e < E; ++e) {
+    int m_e = p[e * 3];
+    int n_e = p[e * 3 + 1];
+    int k_e = p[e * 3 + 2];
+    auto layout_sfb = SfConfig::tile_atom_to_shape_SFB(cute::make_shape(m_e, n_e, k_e, 1));
+    int size_e = cute::size(cute::filter_zeros(layout_sfb));
+    offsets[e + 1] = offsets[e] + size_e;
+  }
+  return {offsets, offsets.back()};
+}
+
+int64_t get_mxf8_sizes_stride() {
+  using Cfg = CfgMxF8Large;
+  using LayoutOut = cutlass::layout::RowMajor;
+  using MxFB = MxF8GemmBuilder<Cfg, LayoutOut>;
+  return std::max({
+      sizeof(typename MxFB::StrideA), sizeof(typename MxFB::StrideB), sizeof(typename MxFB::StrideC)
+  });
+}
+
+int64_t get_mxf8_sizes_layout_sfa() {
+  using Cfg = CfgMxF8Large;
+  using LayoutOut = cutlass::layout::RowMajor;
+  using MxFB = MxF8GemmBuilder<Cfg, LayoutOut>;
+  return sizeof(typename MxFB::InternalLayoutSFA);
+}
+
+int64_t get_mxf8_sizes_layout_sfb() {
+  using Cfg = CfgMxF8Large;
+  using LayoutOut = cutlass::layout::RowMajor;
+  using MxFB = MxF8GemmBuilder<Cfg, LayoutOut>;
+  return sizeof(typename MxFB::InternalLayoutSFB);
+}
+
+// Debug helper: evaluate SFA layout at a few (m, k) points on the host and
+// return the resulting offsets. Helps diagnose whether our packing kernel's
+// `layout(m, k, 0)` indexing is consistent with what CUTLASS expects.
+std::vector<int64_t> probe_mxf8_sfa_layout(int m, int n, int k) {
+  using Cfg = CfgMxF8Large;
+  using LayoutOut = cutlass::layout::RowMajor;
+  using MxFB = MxF8GemmBuilder<Cfg, LayoutOut>;
+  using SfConfig = typename MxFB::Sm1xxBlkScaledConfig;
+
+  auto layout = SfConfig::tile_atom_to_shape_SFA(cute::make_shape(m, n, k, 1));
+  std::vector<int64_t> offsets;
+  offsets.push_back(static_cast<int64_t>(cute::size(cute::filter_zeros(layout))));  // total size
+  // Probe (0,0), (0,1), (0,31), (0,32), (0,63), (0,64), (1,0), (127,0), (127,31), (127,32).
+  offsets.push_back(layout(0, 0, 0));
+  offsets.push_back(layout(0, 1, 0));
+  offsets.push_back(layout(0, 31, 0));
+  offsets.push_back(layout(0, 32, 0));
+  offsets.push_back(layout(0, 63, 0));
+  offsets.push_back(layout(0, 64, 0));
+  offsets.push_back(layout(1, 0, 0));
+  offsets.push_back(layout(127, 0, 0));
+  if (m >= 128) {
+    offsets.push_back(layout(128, 0, 0));
+  } else {
+    offsets.push_back(-1);
+  }
+  return offsets;
+}
+
 // Expose sizeof() info for Python to size workspace tensors correctly.
 // We use max across configs to be safe. Stride/Layout types are the same across
 // configs since they only differ by template-static numeric params.
@@ -748,6 +1206,23 @@ int64_t get_workspace_size(int max_total_tokens, int E, int N, int K, bool use_s
 // v18 MxF8 transcode forward decls.
 void mxf8_transcode_activations(torch::Tensor& payload, torch::Tensor const& scale, torch::Tensor& scale_abs);
 void mxf8_transcode_weights_impl(torch::Tensor& payload, torch::Tensor const& scale, torch::Tensor& scale_abs);
+void moe_mxf8_grouped_mm(
+    torch::Tensor& output, torch::Tensor const& a, torch::Tensor const& b,
+    torch::Tensor const& scales_a, torch::Tensor const& scales_b,
+    torch::Tensor const& expert_offsets, torch::Tensor const& problem_sizes,
+    torch::Tensor& a_ptrs, torch::Tensor& b_ptrs, torch::Tensor& out_ptrs,
+    torch::Tensor& sfa_ptrs, torch::Tensor& sfb_ptrs,
+    torch::Tensor const& stride_a, torch::Tensor const& stride_b, torch::Tensor const& stride_c,
+    torch::Tensor& layout_sfa, torch::Tensor& layout_sfb,
+    torch::Tensor& sfa_buffer, torch::Tensor& sfb_buffer,
+    torch::Tensor const& sfa_byte_offsets, torch::Tensor const& sfb_byte_offsets,
+    torch::Tensor const& workspace);
+std::tuple<std::vector<int32_t>, int64_t> compute_mxf8_sfa_layout_offsets_host(torch::Tensor const&);
+std::tuple<std::vector<int32_t>, int64_t> compute_mxf8_sfb_layout_offsets_host(torch::Tensor const&);
+int64_t get_mxf8_sizes_stride();
+int64_t get_mxf8_sizes_layout_sfa();
+int64_t get_mxf8_sizes_layout_sfb();
+std::vector<int64_t> probe_mxf8_sfa_layout(int m, int n, int k);
 
 // ============================================================================
 // Fused SwiGLU + per-row FP8 requant kernel.
@@ -2272,6 +2747,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_dispatch_gather_hidden_scales", &fused_dispatch_gather_hidden_scales);
   m.def("mxf8_transcode_activations", &mxf8_transcode_activations);
   m.def("mxf8_transcode_weights_impl", &mxf8_transcode_weights_impl);
+  m.def("moe_mxf8_grouped_mm", &moe_mxf8_grouped_mm);
+  m.def("compute_mxf8_sfa_layout_offsets_host", &compute_mxf8_sfa_layout_offsets_host);
+  m.def("compute_mxf8_sfb_layout_offsets_host", &compute_mxf8_sfb_layout_offsets_host);
+  m.def("get_mxf8_sizes_stride", &get_mxf8_sizes_stride);
+  m.def("get_mxf8_sizes_layout_sfa", &get_mxf8_sizes_layout_sfa);
+  m.def("get_mxf8_sizes_layout_sfb", &get_mxf8_sizes_layout_sfb);
+  m.def("probe_mxf8_sfa_layout", &probe_mxf8_sfa_layout);
 }
 '''
 
