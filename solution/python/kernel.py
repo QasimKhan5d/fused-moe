@@ -794,22 +794,42 @@ __global__ void reduce_scatter_unweighted_kernel(
 
   const int TB = blockDim.x;
   int lane = threadIdx.x;
-  const int n2_pairs = N2 / 2;
 
-  __nv_bfloat162* out2 = reinterpret_cast<__nv_bfloat162*>(out + t * N2);
+  // v19-tight: 128-bit vectorized IO. Each uint4 carries 4 bf162 pairs = 8 bf16.
+  // At N2=7168 we have 896 uint4 units per row, matching nicely with TB=128.
+  const int n_vec = N2 / 8;  // number of uint4 along N
+
+  const uint4* out_v_base = reinterpret_cast<const uint4*>(out + t * N2);
+  uint4*       out_v      = const_cast<uint4*>(out_v_base);
 
   #pragma unroll 2
-  for (int j = lane; j < n2_pairs; j += TB) {
-    float2 acc = make_float2(0.0f, 0.0f);
+  for (int j = lane; j < n_vec; j += TB) {
+    float2 a0 = make_float2(0.0f, 0.0f);
+    float2 a1 = make_float2(0.0f, 0.0f);
+    float2 a2 = make_float2(0.0f, 0.0f);
+    float2 a3 = make_float2(0.0f, 0.0f);
     for (int k = beg; k < end; ++k) {
       int m = token_perm[k];
-      const __nv_bfloat162* src2 = reinterpret_cast<const __nv_bfloat162*>(
-          gemm2_out + m * N2);
-      __nv_bfloat162 v = src2[j];
-      acc.x += __bfloat162float(v.x);
-      acc.y += __bfloat162float(v.y);
+      const uint4 v = reinterpret_cast<const uint4*>(gemm2_out + m * N2)[j];
+      __nv_bfloat162 p0 = *reinterpret_cast<const __nv_bfloat162*>(&v.x);
+      __nv_bfloat162 p1 = *reinterpret_cast<const __nv_bfloat162*>(&v.y);
+      __nv_bfloat162 p2 = *reinterpret_cast<const __nv_bfloat162*>(&v.z);
+      __nv_bfloat162 p3 = *reinterpret_cast<const __nv_bfloat162*>(&v.w);
+      a0.x += __bfloat162float(p0.x); a0.y += __bfloat162float(p0.y);
+      a1.x += __bfloat162float(p1.x); a1.y += __bfloat162float(p1.y);
+      a2.x += __bfloat162float(p2.x); a2.y += __bfloat162float(p2.y);
+      a3.x += __bfloat162float(p3.x); a3.y += __bfloat162float(p3.y);
     }
-    out2[j] = __floats2bfloat162_rn(acc.x, acc.y);
+    uint4 packed;
+    __nv_bfloat162 r0 = __floats2bfloat162_rn(a0.x, a0.y);
+    __nv_bfloat162 r1 = __floats2bfloat162_rn(a1.x, a1.y);
+    __nv_bfloat162 r2 = __floats2bfloat162_rn(a2.x, a2.y);
+    __nv_bfloat162 r3 = __floats2bfloat162_rn(a3.x, a3.y);
+    packed.x = *reinterpret_cast<const uint32_t*>(&r0);
+    packed.y = *reinterpret_cast<const uint32_t*>(&r1);
+    packed.z = *reinterpret_cast<const uint32_t*>(&r2);
+    packed.w = *reinterpret_cast<const uint32_t*>(&r3);
+    out_v[j] = packed;
   }
 }
 
@@ -827,7 +847,7 @@ void reduce_scatter_unweighted_prebucketed(
   TORCH_CHECK(out.size(0) == T && out.size(1) == N2);
 
   auto stream = at::cuda::getCurrentCUDAStream(gemm2_out.get_device()).stream();
-  reduce_scatter_unweighted_kernel<<<T, 512, 0, stream>>>(
+  reduce_scatter_unweighted_kernel<<<T, 128, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(gemm2_out.data_ptr()),
       token_offsets.data_ptr<int>(),
       token_perm.data_ptr<int>(),
@@ -1639,7 +1659,7 @@ void reduce_scatter_unweighted(
       sorted_tids.data_ptr<int>(), token_offsets.data_ptr<int>(),
       M, T, token_counts.data_ptr<int>(), token_perm.data_ptr<int>());
 
-  reduce_scatter_unweighted_kernel<<<T, 512, 0, stream>>>(
+  reduce_scatter_unweighted_kernel<<<T, 128, 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(gemm2_out.data_ptr()),
       token_offsets.data_ptr<int>(),
       token_perm.data_ptr<int>(),
@@ -2676,7 +2696,9 @@ def _run_pipeline_dynamic(
     All intermediate buffers come from the cached workspace (sized for T*TOP_K
     max) so there are no per-call tensor allocations on the hot path."""
     topk_idx, assign_w = _route(routing_logits, routing_bias, rsf, T, ls, ne)
-    use_fused_dispatch_gather = bool(os.environ.get("FUSED_DISPATCH_GATHER"))
+    # Benchmarked: fused dispatch-gather is slightly slower at large T due to
+    # higher register pressure in the merged kernel. Keep off by default.
+    use_fused_dispatch_gather = bool(int(os.environ.get("FUSED_DISPATCH_GATHER", "0")))
     # Pass hs_scale through as-is: the C++ gather kernel detects [T, K/128] vs
     # [K/128, T] via strides (K-block-dim match prioritized), so no Python-side
     # transpose is needed. Keeping the transpose here would break CUDA-graph
