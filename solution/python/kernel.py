@@ -293,7 +293,10 @@ void launch_group_gemm(
   hw_info.sm_count = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
 
   typename Gemm::GemmKernel::TileSchedulerArguments scheduler{};
-  scheduler.raster_order = cutlass::gemm::kernel::detail::RasterOrderOptions::AlongN;
+  // AlongM raster (empirically ~3-5% faster than AlongN on T>=11948 where
+  // per-expert M dominates; flat on small/mid T). max_swizzle_size=1 stays
+  // (2/4 regressed by 5-17% on large T).
+  scheduler.raster_order = cutlass::gemm::kernel::detail::RasterOrderOptions::AlongM;
   scheduler.max_swizzle_size = 1;
   if (const char* env = std::getenv("CUTLASS_RASTER_ORDER")) {
     if (env[0] == 'M' || env[0] == 'm') {
