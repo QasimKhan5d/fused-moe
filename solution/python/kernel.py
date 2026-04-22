@@ -139,7 +139,33 @@ struct CfgVeryLargeM {
 // (done upstream in a dedicated transcode kernel).
 // ============================================================================
 struct CfgMxF8Large {
+  using MmaTileShape = Shape<_256, _128, _128>;
+  using ClusterShape = Shape<_2, _1, _1>;
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmMxf8f6f4Sm100;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm;
+};
+
+// 1SM variant used for testing the FP8-output path (epilogue overhead tends
+// to scale better at 1SM where Less SMEM pressure means the amax-reduce
+// epilogue can run in parallel with mainloop writeout).
+struct CfgMxF8Large1SM {
   using MmaTileShape = Shape<_128, _128, _128>;
+  using ClusterShape = Shape<_1, _1, _1>;
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmMxf8f6f4Sm100;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm;
+};
+
+// Tile variants for GEMM2 experiments (K=2048, N=7168 — different shape
+// characteristics than GEMM1). Trying more N tile capacity to amortize the
+// smaller K-iteration count.
+struct CfgMxF8G2_256_256 {
+  using MmaTileShape = Shape<_256, _256, _128>;
+  using ClusterShape = Shape<_2, _1, _1>;
+  using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized2SmMxf8f6f4Sm100;
+  using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized2Sm;
+};
+struct CfgMxF8G2_128_256_1SM {
+  using MmaTileShape = Shape<_128, _256, _128>;
   using ClusterShape = Shape<_1, _1, _1>;
   using KernelSchedule = cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmMxf8f6f4Sm100;
   using EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm;
@@ -206,6 +232,66 @@ struct MxF8GemmBuilder {
   using InternalLayoutSFB = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFB;
   using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
   static constexpr int SFVecSize = Gemm::GemmKernel::CollectiveMainloop::SFVecSize;
+};
+
+// ============================================================================
+// MxF8 → FP8+UE8M0 block-scaled output variant. Uses
+// `LinCombBlockScaleFactor` fusion to emit FP8 payload + per-32-col UE8M0
+// scales directly from the epilogue, eliminating the bf16 intermediate's HBM
+// round-trip (saves ~472 MB of writes at T=14107, ~60 μs).
+// ============================================================================
+using ElementD_FP8 = cutlass::float_e4m3_t;
+using ElementSFD   = cutlass::float_ue8m0_t;
+constexpr int AlignmentD_FP8 = 16;  // 128 bits / 8 bits = 16 fp8 elements
+constexpr int OutputSFVectorSize_FP8 = 32;
+
+template <typename Cfg, typename LayoutOut>
+struct MxF8GemmBuilderFP8Out {
+  using FusionOperation = cutlass::epilogue::fusion::LinCombBlockScaleFactor<
+      OutputSFVectorSize_FP8,
+      ElementD_FP8,
+      ElementAccumulator,
+      ElementSFD,
+      LayoutOut,
+      void,
+      float>;
+
+  using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+      cutlass::arch::Sm100, cutlass::arch::OpClassBlockScaledTensorOp,
+      typename Cfg::MmaTileShape, typename Cfg::ClusterShape,
+      cutlass::epilogue::collective::EpilogueTileAuto,
+      ElementAccumulator, ElementAccumulator,
+      void,          LayoutOut*, AlignmentC,
+      ElementD_FP8,  LayoutOut*, AlignmentD_FP8,
+      typename Cfg::EpilogueSchedule,
+      FusionOperation>::CollectiveOp;
+
+  using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+      cutlass::arch::Sm100, cutlass::arch::OpClassBlockScaledTensorOp,
+      MmaTypePairA, LayoutA*, AlignmentA,
+      MmaTypePairB, LayoutB*, AlignmentB,
+      ElementAccumulator,
+      typename Cfg::MmaTileShape, typename Cfg::ClusterShape,
+      cutlass::gemm::collective::StageCountAutoCarveout<
+          static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+      typename Cfg::KernelSchedule>::CollectiveOp;
+
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      ProblemShape, CollectiveMainloop, CollectiveEpilogue, void>;
+  using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+  using StrideA = typename Gemm::GemmKernel::InternalStrideA;
+  using StrideB = typename Gemm::GemmKernel::InternalStrideB;
+  using StrideC = typename Gemm::GemmKernel::InternalStrideC;
+  using StrideD = typename Gemm::GemmKernel::InternalStrideD;
+  using InternalLayoutSFA = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFA;
+  using InternalLayoutSFB = typename Gemm::GemmKernel::CollectiveMainloop::InternalLayoutSFB;
+  using Sm1xxBlkScaledConfig = typename Gemm::GemmKernel::CollectiveMainloop::Sm1xxBlkScaledConfig;
+  static constexpr int SFVecSize = Gemm::GemmKernel::CollectiveMainloop::SFVecSize;
+  using Sm1xxBlockScaledOutputConfig = cutlass::detail::Sm1xxBlockScaledOutputConfig<
+      OutputSFVectorSize_FP8,
+      cute::UMMA::Major::K>;
+  using OutputSFAtom = typename Sm1xxBlockScaledOutputConfig::SfAtom;
+  using LayoutSFD    = typename Sm1xxBlockScaledOutputConfig::LayoutSF;
 };
 
 // MxF8 per-expert starts kernel: fills ptr arrays, strides, and SFA/SFB
@@ -330,8 +416,165 @@ void launch_mxf8_group_gemm(
   TORCH_CHECK(status == cutlass::Status::kSuccess, "MxF8 can_implement failed: ", int(status));
   status = gemm_op.initialize(args, const_cast<void*>(workspace.data_ptr()), stream);
   TORCH_CHECK(status == cutlass::Status::kSuccess, "MxF8 initialize failed: ", int(status));
-  status = gemm_op.run(stream);
+  // Enable PDL (Programmatic Dependent Launch, SM100A) — allows the next kernel
+  // in the stream to begin executing preambles while this GEMM is still running.
+  const char* disable_pdl = std::getenv("MXF8_DISABLE_PDL");
+  bool pdl_enabled = !(disable_pdl && std::string(disable_pdl) == "1");
+  status = gemm_op.run(stream, /*cuda_adapter=*/nullptr, pdl_enabled);
   TORCH_CHECK(status == cutlass::Status::kSuccess, "MxF8 run failed: ", int(status));
+}
+
+// Ptr-array populator for the FP8-output variant. Writes D_FP8 ptrs AND SFD
+// (per-expert block-scale output) ptrs.
+template <typename Cfg, typename LayoutOut>
+__global__ void get_group_gemm_starts_kernel_mxf8_fp8out(
+    int32_t const* __restrict__ expert_offsets,
+    int32_t const* __restrict__ sfa_offsets,
+    int32_t const* __restrict__ sfb_offsets,
+    int32_t const* __restrict__ sfd_offsets,
+    ElementAB** a_ptrs,
+    ElementAB** b_ptrs,
+    ElementD_FP8** d_ptrs,
+    ElementSFD** sfd_ptrs,
+    ElementSF_mx** sfa_ptrs,
+    ElementSF_mx** sfb_ptrs,
+    ElementAB* a_base,
+    ElementAB* b_base,
+    ElementD_FP8* d_base,
+    ElementSFD* sfd_base,
+    ElementSF_mx* sfa_base,
+    ElementSF_mx* sfb_base,
+    typename MxF8GemmBuilderFP8Out<Cfg, LayoutOut>::InternalLayoutSFA* layout_sfa_base,
+    typename MxF8GemmBuilderFP8Out<Cfg, LayoutOut>::InternalLayoutSFB* layout_sfb_base,
+    typename MxF8GemmBuilderFP8Out<Cfg, LayoutOut>::LayoutSFD* layout_sfd_base,
+    typename MxF8GemmBuilderFP8Out<Cfg, LayoutOut>::StrideA* stride_a_base,
+    typename MxF8GemmBuilderFP8Out<Cfg, LayoutOut>::StrideB* stride_b_base,
+    typename MxF8GemmBuilderFP8Out<Cfg, LayoutOut>::StrideD* stride_d_base,
+    int32_t const* problem_sizes)
+{
+  using MxFB = MxF8GemmBuilderFP8Out<Cfg, LayoutOut>;
+  using SfConfig = typename MxFB::Sm1xxBlkScaledConfig;
+  using SfOutConfig = typename MxFB::Sm1xxBlockScaledOutputConfig;
+
+  int eid = threadIdx.x;
+  int m_e = problem_sizes[eid * 3];
+  int n_e = problem_sizes[eid * 3 + 1];
+  int k_e = problem_sizes[eid * 3 + 2];
+
+  int64_t expert_offset = static_cast<int64_t>(expert_offsets[eid]);
+  int64_t a_stride = expert_offset * k_e;
+  int64_t b_stride = int64_t(eid) * int64_t(k_e) * int64_t(n_e);
+
+  a_ptrs[eid] = a_base + a_stride;
+  b_ptrs[eid] = b_base + b_stride;
+  d_ptrs[eid] = d_base + expert_offset * n_e;
+  sfa_ptrs[eid] = sfa_base + sfa_offsets[eid];
+  sfb_ptrs[eid] = sfb_base + sfb_offsets[eid];
+  sfd_ptrs[eid] = sfd_base + sfd_offsets[eid];
+
+  layout_sfa_base[eid] = SfConfig::tile_atom_to_shape_SFA(
+      cute::make_shape(m_e, n_e, k_e, 1));
+  layout_sfb_base[eid] = SfConfig::tile_atom_to_shape_SFB(
+      cute::make_shape(m_e, n_e, k_e, 1));
+  layout_sfd_base[eid] = SfOutConfig::tile_atom_to_shape_SFD(
+      cute::make_shape(m_e, n_e, k_e, 1));
+
+  stride_a_base[eid] = cutlass::make_cute_packed_stride(
+      typename MxFB::StrideA{}, cute::make_shape(m_e, k_e, 1));
+  stride_b_base[eid] = cutlass::make_cute_packed_stride(
+      typename MxFB::StrideB{}, cute::make_shape(n_e, k_e, 1));
+  stride_d_base[eid] = cutlass::make_cute_packed_stride(
+      typename MxFB::StrideD{}, cute::make_shape(m_e, n_e, 1));
+}
+
+// Global device-side "1.0f" constant used as the unconditional norm_constant
+// by LinCombBlockScaleFactor (CUTLASS always dereferences norm_constant_ptr).
+__device__ __constant__ float g_mxf8_norm_constant_one = 1.0f;
+
+template <typename Cfg, typename LayoutOut>
+void launch_mxf8_group_gemm_fp8out(
+    torch::Tensor& a_ptrs,
+    torch::Tensor& b_ptrs,
+    torch::Tensor& d_ptrs,
+    torch::Tensor& sfd_ptrs,
+    torch::Tensor& sfa_ptrs,
+    torch::Tensor& sfb_ptrs,
+    torch::Tensor const& stride_a,
+    torch::Tensor const& stride_b,
+    torch::Tensor const& stride_d,
+    torch::Tensor const& layout_sfa,
+    torch::Tensor const& layout_sfb,
+    torch::Tensor const& layout_sfd,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor const& workspace,
+    int num_experts,
+    cudaStream_t stream)
+{
+  using MxFB = MxF8GemmBuilderFP8Out<Cfg, LayoutOut>;
+  using Gemm = typename MxFB::Gemm;
+  using UnderlyingProblemShape = typename ProblemShape::UnderlyingProblemShape;
+
+  typename Gemm::GemmKernel::MainloopArguments mainloop_args{
+      static_cast<const ElementAB**>(a_ptrs.data_ptr()),
+      static_cast<typename MxFB::StrideA*>(const_cast<void*>(stride_a.data_ptr())),
+      static_cast<const ElementAB**>(b_ptrs.data_ptr()),
+      static_cast<typename MxFB::StrideB*>(const_cast<void*>(stride_b.data_ptr())),
+      static_cast<const ElementSF_mx**>(sfa_ptrs.data_ptr()),
+      reinterpret_cast<typename MxFB::InternalLayoutSFA*>(const_cast<void*>(layout_sfa.data_ptr())),
+      static_cast<const ElementSF_mx**>(sfb_ptrs.data_ptr()),
+      reinterpret_cast<typename MxFB::InternalLayoutSFB*>(const_cast<void*>(layout_sfb.data_ptr()))
+  };
+
+  // Resolve __constant__ memory to a device pointer for norm_constant_ptr.
+  // CUTLASS unconditionally dereferences norm_constant_ptr even if dNormConst
+  // is a zero-stride (broadcast). Must be non-null.
+  float* norm_constant_device_ptr = nullptr;
+  cudaGetSymbolAddress(reinterpret_cast<void**>(&norm_constant_device_ptr),
+                        g_mxf8_norm_constant_one);
+
+  typename Gemm::GemmKernel::EpilogueArguments epilogue_args{};
+  epilogue_args.thread.alpha = 1.0f;
+  epilogue_args.thread.beta  = 0.0f;
+  epilogue_args.thread.block_scale_factor_ptr =
+      static_cast<ElementSFD**>(sfd_ptrs.data_ptr());
+  epilogue_args.thread.norm_constant_ptr = norm_constant_device_ptr;
+  epilogue_args.ptr_C = nullptr;
+  epilogue_args.dC    = static_cast<typename MxFB::StrideC*>(
+      const_cast<void*>(stride_d.data_ptr()));  // unused (beta=0) but must be non-null
+  epilogue_args.ptr_D = static_cast<ElementD_FP8**>(d_ptrs.data_ptr());
+  epilogue_args.dD    = static_cast<typename MxFB::StrideD*>(
+      const_cast<void*>(stride_d.data_ptr()));
+
+  cutlass::KernelHardwareInfo hw_info;
+  hw_info.device_id = c10::cuda::current_device();
+  hw_info.sm_count  = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+
+  typename Gemm::GemmKernel::TileSchedulerArguments scheduler{};
+  scheduler.raster_order = cutlass::gemm::kernel::detail::RasterOrderOptions::AlongM;
+  scheduler.max_swizzle_size = 1;
+
+  auto* ps = static_cast<UnderlyingProblemShape*>(const_cast<void*>(problem_sizes.data_ptr()));
+  typename Gemm::GemmKernel::Arguments args{
+      cutlass::gemm::GemmUniversalMode::kGrouped,
+      {num_experts, ps, nullptr},
+      mainloop_args,
+      epilogue_args,
+      hw_info,
+      scheduler
+  };
+
+  Gemm gemm_op;
+  auto status = gemm_op.can_implement(args);
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "MxF8 FP8-out can_implement failed: ", int(status));
+  status = gemm_op.initialize(args, const_cast<void*>(workspace.data_ptr()), stream);
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "MxF8 FP8-out initialize failed: ", int(status));
+  const char* disable_pdl = std::getenv("MXF8_DISABLE_PDL");
+  bool pdl_enabled = !(disable_pdl && std::string(disable_pdl) == "1");
+  status = gemm_op.run(stream, /*cuda_adapter=*/nullptr, pdl_enabled);
+  TORCH_CHECK(status == cutlass::Status::kSuccess,
+              "MxF8 FP8-out run failed: ", int(status));
 }
 
 template <typename Cfg, typename LayoutOut>
@@ -704,52 +947,114 @@ __device__ __forceinline__ float ue8m0_byte_to_fp32(uint8_t b) {
 // - scale_abs: fp32 buffer with |scale| values (same shape as input scale). CUTLASS
 //              converts these to UE8M0 internally via `ElementSF(float)` which ceils.
 //   Output size same as input scale.
-__global__ void mxf8_transcode_kernel(
-    __nv_fp8_e4m3*       __restrict__ payload,  // in/out, size N_pay = M * K
-    const float*         __restrict__ scale_signed,  // in, size N_sc = M * K/128 (contiguous)
-    float*               __restrict__ scale_ue8m0,  // out: ue8m0 as fp32 (pow-of-2)
-    int                   M,                        // leading dim (rows)
-    int                   K,                        // K
-    int                   K_blocks,                 // = K/128
-    int                   payload_row_stride,       // = K for contiguous row-major
-    int                   scale_row_stride          // = K_blocks for contiguous
-) {
-  // Grid: (M * K_blocks) blocks; each block handles one 128-element sub-row.
-  int m = blockIdx.y;
-  int kb = blockIdx.x;
-  if (m >= M || kb >= K_blocks) return;
-
+// Vectorized transcode kernel: one block per row; each thread handles 16 fp8
+// elements (one uint4 vector). Shared-memory staging of per-(m, kb) scale
+// residuals + 1-block-per-row launch pattern eliminates the massive block-
+// count overhead of the original (M * K_blocks) launch.
+//
+// When `sfa_out` != nullptr, also fuses the SFA-tiled-layout packing step
+// (writing UE8M0 bytes directly into CUTLASS tiled positions) -- saves a
+// separate pack kernel launch.
+template <typename Cfg, typename LayoutOut>
+__global__ void mxf8_transcode_pack_kernel(
+    __nv_fp8_e4m3*       __restrict__ payload,
+    const float*         __restrict__ scale_signed,
+    float*               __restrict__ scale_ue8m0,
+    int                   M,
+    int                   K,
+    int                   K_blocks,
+    int                   payload_row_stride,
+    int                   scale_row_stride,
+    // fused SFA-pack args (optional; nullable via sfa_out==nullptr)
+    const int*            expert_offsets,
+    const int*            sfa_byte_offsets,
+    typename MxF8GemmBuilder<Cfg, LayoutOut>::InternalLayoutSFA* sfa_layouts,
+    int                   E,
+    cutlass::float_ue8m0_t* sfa_out)
+{
+  int m = blockIdx.x;
+  if (m >= M) return;
   int tid = threadIdx.x;
-  int scale_idx = m * scale_row_stride + kb;
-  float s_signed = scale_signed[scale_idx];
-  float s_abs = fabsf(s_signed);
-  float sign = (s_signed < 0.0f) ? -1.0f : 1.0f;
+  int bdim = blockDim.x;
 
-  // Ceil to pow-of-2.
-  uint8_t ue8m0_byte = ue8m0_ceil_from_abs_fp32(s_abs);
-  float ue8m0_val = ue8m0_byte_to_fp32(ue8m0_byte);
+  // Shared residual scale-per-K-block storage; 1 float per K-block.
+  extern __shared__ float sr_shared[];   // [K_blocks]
 
-  // Write ue8m0 (fp32 power-of-2 value) as the scale. This is the value that
-  // MxF8 hardware uses and also the value that our FP32-blockwise kernel
-  // uses as stand-in. `r = |scale|/ue8m0` is absorbed into the payload below.
-  if (tid == 0) {
-    scale_ue8m0[scale_idx] = ue8m0_val;
+  // Fused SFA-pack: locate the (expert, local_m) for this global_m row ONCE,
+  // then write UE8M0 bytes directly into CUTLASS tiled SFA layout alongside
+  // computing sr_shared below.
+  int e = 0;
+  int local_m = m;
+  cutlass::float_ue8m0_t* sfa_row_base = nullptr;
+  typename MxF8GemmBuilder<Cfg, LayoutOut>::InternalLayoutSFA sfa_layout{};
+  if (sfa_out != nullptr) {
+    if (tid == 0) {
+      int e_local = 0;
+      for (int ee = 0; ee < E; ++ee) {
+        if (m < expert_offsets[ee + 1]) { e_local = ee; break; }
+      }
+      sr_shared[K_blocks] = __int_as_float(e_local);
+    }
+    __syncthreads();
+    e = __float_as_int(sr_shared[K_blocks]);
+    local_m = m - expert_offsets[e];
+    sfa_row_base = sfa_out + sfa_byte_offsets[e];
+    sfa_layout = sfa_layouts[e];
   }
 
-  float r = (ue8m0_val > 0.0f) ? (s_abs / ue8m0_val) : 1.0f;
-  float sr = sign * r;
+  // Cooperatively load + process K-block scales.
+  const float* scale_row = scale_signed + m * scale_row_stride;
+  float* scale_ue8m0_row = scale_ue8m0 + m * scale_row_stride;
+  for (int kb = tid; kb < K_blocks; kb += bdim) {
+    float s_signed = scale_row[kb];
+    float s_abs = fabsf(s_signed);
+    float sign = (s_signed < 0.0f) ? -1.0f : 1.0f;
+    uint8_t ue8m0_byte = ue8m0_ceil_from_abs_fp32(s_abs);
+    float ue8m0_val = ue8m0_byte_to_fp32(ue8m0_byte);
+    scale_ue8m0_row[kb] = ue8m0_val;
+    float r = (ue8m0_val > 0.0f) ? (s_abs / ue8m0_val) : 1.0f;
+    sr_shared[kb] = sign * r;
 
-  // Transcode payload: 128 FP8 elements per warp block.
-  __nv_fp8_e4m3* row = payload + m * payload_row_stride + kb * 128;
-  // 128 threads each handle 1 element (if blockDim.x==128). If smaller, stride.
-  int TB = blockDim.x;
-  for (int j = tid; j < 128; j += TB) {
-    float v = (float)row[j];
-    float vn = v * sr;
-    // Clamp to FP8 E4M3 range to avoid NaN on overflow.
-    if (vn > 448.0f) vn = 448.0f;
-    if (vn < -448.0f) vn = -448.0f;
-    row[j] = __nv_fp8_e4m3(vn);
+    // Fused SFA pack: write UE8M0 byte to each of the 4 sub-blocks.
+    if (sfa_out != nullptr) {
+      cutlass::float_ue8m0_t val = cutlass::float_ue8m0_t::bitcast(ue8m0_byte);
+      int k0 = kb * 128;
+      int off0 = sfa_layout(local_m, k0 +  0, 0);
+      int off1 = sfa_layout(local_m, k0 + 32, 0);
+      int off2 = sfa_layout(local_m, k0 + 64, 0);
+      int off3 = sfa_layout(local_m, k0 + 96, 0);
+      sfa_row_base[off0] = val;
+      sfa_row_base[off1] = val;
+      sfa_row_base[off2] = val;
+      sfa_row_base[off3] = val;
+    }
+  }
+  __syncthreads();
+
+  // Vectorized payload transcode: each thread handles 16 fp8 elements (one uint4).
+  __nv_fp8_e4m3* row = payload + m * payload_row_stride;
+  int num_vec = K / 16;  // 16 fp8 = 16 bytes = 1 uint4
+  uint4* row_vec = reinterpret_cast<uint4*>(row);
+
+  for (int i = tid; i < num_vec; i += bdim) {
+    int k_start = i * 16;
+    int kb = k_start / 128;   // which K-block-128
+    float sr = sr_shared[kb];
+    uint4 v = row_vec[i];
+    // Decode 16 fp8 bytes, rescale, re-encode. Using __nv_fp8_storage_t trick.
+    uint8_t* bytes = reinterpret_cast<uint8_t*>(&v);
+    #pragma unroll
+    for (int j = 0; j < 16; ++j) {
+      __nv_fp8_e4m3 fp8v;
+      fp8v.__x = bytes[j];
+      float fv = (float)fp8v;
+      fv *= sr;
+      if (fv >  448.0f) fv =  448.0f;
+      if (fv < -448.0f) fv = -448.0f;
+      __nv_fp8_e4m3 fp8_out(fv);
+      bytes[j] = fp8_out.__x;
+    }
+    row_vec[i] = v;
   }
 }
 
@@ -766,16 +1071,372 @@ void mxf8_transcode_activations(
   int K_blocks = scale.size(1);
   TORCH_CHECK(K_blocks == K / 128, "scale K/128 mismatch");
   TORCH_CHECK(scale.size(0) == M, "scale M mismatch");
+  TORCH_CHECK(K % 16 == 0, "K must be a multiple of 16");
+
+  using Cfg = CfgMxF8Large;
+  using LayoutOut = cutlass::layout::RowMajor;
+  using MxFB = MxF8GemmBuilder<Cfg, LayoutOut>;
 
   auto stream = at::cuda::getCurrentCUDAStream(payload.get_device()).stream();
-  dim3 grid(K_blocks, M);
-  mxf8_transcode_kernel<<<grid, 128, 0, stream>>>(
+  int threads = 256;
+  size_t smem_bytes = (K_blocks + 1) * sizeof(float);
+  mxf8_transcode_pack_kernel<Cfg, LayoutOut><<<M, threads, smem_bytes, stream>>>(
       reinterpret_cast<__nv_fp8_e4m3*>(payload.data_ptr()),
       scale.data_ptr<float>(),
       scale_ue8m0.data_ptr<float>(),
       M, K, K_blocks,
-      payload.stride(0),   // payload row stride
-      scale.stride(0));    // scale row stride
+      payload.stride(0),
+      scale.stride(0),
+      nullptr, nullptr, nullptr, 0, nullptr);  // no SFA pack fusion
+}
+
+// Fused variant: transcode + pack SFA in one kernel launch.
+void mxf8_transcode_and_pack_sfa(
+    torch::Tensor& payload,
+    torch::Tensor const& scale,
+    torch::Tensor& scale_ue8m0,
+    torch::Tensor const& expert_offsets,  // [E+1] inclusive
+    torch::Tensor const& sfa_byte_offsets,
+    torch::Tensor& sfa_layouts,           // [E * sizeof(InternalLayoutSFA)]
+    torch::Tensor& sfa_buffer)
+{
+  TORCH_CHECK(payload.is_cuda() && payload.scalar_type() == torch::kFloat8_e4m3fn);
+  int M = payload.size(0);
+  int K = payload.size(1);
+  int K_blocks = scale.size(1);
+  int E = expert_offsets.size(0) - 1;
+
+  using Cfg = CfgMxF8Large;
+  using LayoutOut = cutlass::layout::RowMajor;
+  using MxFB = MxF8GemmBuilder<Cfg, LayoutOut>;
+
+  auto stream = at::cuda::getCurrentCUDAStream(payload.get_device()).stream();
+  int threads = 256;
+  size_t smem_bytes = (K_blocks + 1) * sizeof(float);
+  mxf8_transcode_pack_kernel<Cfg, LayoutOut><<<M, threads, smem_bytes, stream>>>(
+      reinterpret_cast<__nv_fp8_e4m3*>(payload.data_ptr()),
+      scale.data_ptr<float>(),
+      scale_ue8m0.data_ptr<float>(),
+      M, K, K_blocks,
+      payload.stride(0),
+      scale.stride(0),
+      expert_offsets.data_ptr<int>(),
+      sfa_byte_offsets.data_ptr<int>(),
+      reinterpret_cast<typename MxFB::InternalLayoutSFA*>(sfa_layouts.data_ptr()),
+      E,
+      reinterpret_cast<cutlass::float_ue8m0_t*>(sfa_buffer.data_ptr()));
+}
+
+// Fused SwiGLU + FP8 per-row requant + MxF8 transcode-and-pack-SFA.
+// Writes act_q, row_scales, broadcast_scales_ue8m0 AND packs SFA for GEMM2
+// in one pass. Scales from swiglu × routing weight may be negative so we
+// sign-split payload multiplier.
+template <int H_, typename Cfg, typename LayoutOut>
+__global__ void swiglu_fp8_requant_weighted_mxf8_kernel(
+    const __nv_bfloat16* __restrict__ gemm1_out,
+    const float*         __restrict__ sorted_weights,
+    __nv_fp8_e4m3*       __restrict__ act_q,
+    float*               __restrict__ row_scales,
+    float*               __restrict__ broadcast_scales_ue8m0,
+    int M,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ sfa_byte_offsets,
+    typename MxF8GemmBuilder<Cfg, LayoutOut>::InternalLayoutSFA* sfa_layouts,
+    int E,
+    cutlass::float_ue8m0_t* sfa_out)
+{
+  constexpr int H = H_;
+  constexpr int TB = 256;
+  const int m = blockIdx.x;
+  if (m >= M) return;
+  const __nv_bfloat16* row_in = gemm1_out + m * (2 * H);
+  __nv_fp8_e4m3*       row_q  = act_q + m * H;
+
+  const int tid = threadIdx.x;
+
+  __shared__ float s_absmax;
+  __shared__ int   expert_id_s;
+  if (tid == 0) {
+    s_absmax = 0.0f;
+    int e = 0;
+    for (int ee = 0; ee < E; ++ee) {
+      if (m < expert_offsets[ee + 1]) { e = ee; break; }
+    }
+    expert_id_s = e;
+  }
+  __syncthreads();
+  int e = expert_id_s;
+  int local_m = m - expert_offsets[e];
+
+  auto sfa_layout = sfa_layouts[e];
+  cutlass::float_ue8m0_t* sfa_row_base = sfa_out + sfa_byte_offsets[e];
+
+  constexpr int ITERS = H / TB;
+  float act_cache[ITERS];
+  float thread_absmax = 0.0f;
+  #pragma unroll
+  for (int j = 0; j < ITERS; ++j) {
+    int i = tid + j * TB;
+    float g = __bfloat162float(row_in[i]);
+    float u = __bfloat162float(row_in[H + i]);
+    float act = g * (u * (0.5f + 0.5f * __tanhf(u * 0.5f)));
+    act_cache[j] = act;
+    thread_absmax = fmaxf(thread_absmax, fabsf(act));
+  }
+  constexpr int NW = TB / 32;
+  __shared__ float s_partial[NW];
+  float v = thread_absmax;
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    v = fmaxf(v, __shfl_xor_sync(0xffffffff, v, offset));
+  }
+  if ((tid & 31) == 0) s_partial[tid >> 5] = v;
+  __syncthreads();
+
+  if (tid < 32) {
+    float w = (tid < NW) ? s_partial[tid] : -INFINITY;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      w = fmaxf(w, __shfl_xor_sync(0xffffffff, w, offset));
+    }
+    if (tid == 0) s_absmax = w;
+  }
+  __syncthreads();
+
+  float row_max = fmaxf(s_absmax, 1e-8f);
+  float scale = fmaxf(row_max * (1.0f / 448.0f), 1e-8f);
+
+  float w_route = sorted_weights[m];
+  float scale_weighted = scale * w_route;
+
+  float s_abs = fabsf(scale_weighted);
+  float sign  = (scale_weighted < 0.0f) ? -1.0f : 1.0f;
+  uint8_t ue8m0_byte = ue8m0_ceil_from_abs_fp32(s_abs);
+  float   ue8m0_val  = ue8m0_byte_to_fp32(ue8m0_byte);
+  float   r          = (ue8m0_val > 0.0f) ? (s_abs / ue8m0_val) : 1.0f;
+  float   sr         = sign * r;
+  float inv_scale_times_sr = (scale > 0.0f) ? (sr / scale) : 0.0f;
+
+  if (tid == 0) {
+    row_scales[m] = scale;
+  }
+
+  constexpr int KBLOCKS = H / 128;
+  if (tid < KBLOCKS) {
+    broadcast_scales_ue8m0[m * KBLOCKS + tid] = ue8m0_val;
+  }
+
+  for (int kb = tid; kb < KBLOCKS; kb += TB) {
+    cutlass::float_ue8m0_t val = cutlass::float_ue8m0_t::bitcast(ue8m0_byte);
+    int k0 = kb * 128;
+    int off0 = sfa_layout(local_m, k0 +  0, 0);
+    int off1 = sfa_layout(local_m, k0 + 32, 0);
+    int off2 = sfa_layout(local_m, k0 + 64, 0);
+    int off3 = sfa_layout(local_m, k0 + 96, 0);
+    sfa_row_base[off0] = val;
+    sfa_row_base[off1] = val;
+    sfa_row_base[off2] = val;
+    sfa_row_base[off3] = val;
+  }
+
+  #pragma unroll
+  for (int j = 0; j < ITERS; ++j) {
+    int i = tid + j * TB;
+    float q = act_cache[j] * inv_scale_times_sr;
+    if (q >  448.0f) q =  448.0f;
+    if (q < -448.0f) q = -448.0f;
+    row_q[i] = __nv_fp8_e4m3(q);
+  }
+}
+
+void swiglu_fp8_requant_weighted_mxf8(
+    torch::Tensor const& gemm1_out,
+    torch::Tensor const& sorted_weights,
+    torch::Tensor&       act_q,
+    torch::Tensor&       row_scales,
+    torch::Tensor&       broadcast_scales_ue8m0,
+    torch::Tensor const& expert_offsets,
+    torch::Tensor const& sfa_byte_offsets,
+    torch::Tensor&       sfa_layouts,
+    torch::Tensor&       sfa_buffer)
+{
+  int M = gemm1_out.size(0);
+  int N1 = gemm1_out.size(1);
+  int H = N1 / 2;
+  int E = expert_offsets.size(0) - 1;
+  using Cfg = CfgMxF8Large;
+  using LayoutOut = cutlass::layout::RowMajor;
+  using MxFB = MxF8GemmBuilder<Cfg, LayoutOut>;
+  auto stream = at::cuda::getCurrentCUDAStream(gemm1_out.get_device()).stream();
+
+  #define LAUNCH_HW_MXF8(HCONST)                                                \
+    do {                                                                         \
+      swiglu_fp8_requant_weighted_mxf8_kernel<HCONST, Cfg, LayoutOut>            \
+          <<<M, 256, 0, stream>>>(                                               \
+              reinterpret_cast<const __nv_bfloat16*>(gemm1_out.data_ptr()),      \
+              sorted_weights.data_ptr<float>(),                                  \
+              reinterpret_cast<__nv_fp8_e4m3*>(act_q.data_ptr()),                \
+              row_scales.data_ptr<float>(),                                      \
+              broadcast_scales_ue8m0.data_ptr<float>(), M,                       \
+              expert_offsets.data_ptr<int>(),                                    \
+              sfa_byte_offsets.data_ptr<int>(),                                  \
+              reinterpret_cast<typename MxFB::InternalLayoutSFA*>(               \
+                  sfa_layouts.data_ptr()),                                       \
+              E,                                                                 \
+              reinterpret_cast<cutlass::float_ue8m0_t*>(sfa_buffer.data_ptr())); \
+    } while (0)
+
+  switch (H) {
+    case 1024: LAUNCH_HW_MXF8(1024); break;
+    case 2048: LAUNCH_HW_MXF8(2048); break;
+    case 4096: LAUNCH_HW_MXF8(4096); break;
+    default:
+      TORCH_CHECK(false, "Unsupported H=", H);
+  }
+  #undef LAUNCH_HW_MXF8
+}
+
+// Fully-fused gather + mxf8 transcode + SFA pack kernel.
+template <typename Cfg, typename LayoutOut>
+__global__ void fused_gather_mxf8_kernel(
+    const __nv_fp8_e4m3* __restrict__ hidden_states,
+    const float*         __restrict__ hs_scale,
+    int                   hs_scale_stride_t,
+    int                   hs_scale_stride_b,
+    const int*           __restrict__ sorted_tids,
+    __nv_fp8_e4m3*       __restrict__ packed_acts,
+    float*               __restrict__ packed_act_scales_ue8m0,
+    int T, int K1, int K1_blocks,
+    const int* __restrict__ expert_offsets,
+    const int* __restrict__ sfa_byte_offsets,
+    typename MxF8GemmBuilder<Cfg, LayoutOut>::InternalLayoutSFA* sfa_layouts,
+    int E,
+    cutlass::float_ue8m0_t* sfa_out)
+{
+  int m = blockIdx.x;
+  int tid_src = sorted_tids[m];
+  if (tid_src < 0 || tid_src >= T) tid_src = 0;
+
+  extern __shared__ float sr_shared[];
+
+  int tid = threadIdx.x;
+  int bdim = blockDim.x;
+
+  __shared__ int expert_id_s;
+  if (tid == 0) {
+    int e = 0;
+    for (int ee = 0; ee < E; ++ee) {
+      if (m < expert_offsets[ee + 1]) { e = ee; break; }
+    }
+    expert_id_s = e;
+  }
+  __syncthreads();
+  int e = expert_id_s;
+  int local_m = m - expert_offsets[e];
+
+  auto sfa_layout = sfa_layouts[e];
+  cutlass::float_ue8m0_t* sfa_row_base = sfa_out + sfa_byte_offsets[e];
+
+  const float* ssrc = hs_scale + tid_src * hs_scale_stride_t;
+  float* sdst = packed_act_scales_ue8m0 + m * K1_blocks;
+  for (int kb = tid; kb < K1_blocks; kb += bdim) {
+    float s_signed = ssrc[kb * hs_scale_stride_b];
+    float s_abs = fabsf(s_signed);
+    float sign = (s_signed < 0.0f) ? -1.0f : 1.0f;
+    uint8_t ue8m0_byte = ue8m0_ceil_from_abs_fp32(s_abs);
+    float ue8m0_val = ue8m0_byte_to_fp32(ue8m0_byte);
+    sdst[kb] = ue8m0_val;
+    float r = (ue8m0_val > 0.0f) ? (s_abs / ue8m0_val) : 1.0f;
+    sr_shared[kb] = sign * r;
+
+    cutlass::float_ue8m0_t val = cutlass::float_ue8m0_t::bitcast(ue8m0_byte);
+    int k0 = kb * 128;
+    int off0 = sfa_layout(local_m, k0 +  0, 0);
+    int off1 = sfa_layout(local_m, k0 + 32, 0);
+    int off2 = sfa_layout(local_m, k0 + 64, 0);
+    int off3 = sfa_layout(local_m, k0 + 96, 0);
+    sfa_row_base[off0] = val;
+    sfa_row_base[off1] = val;
+    sfa_row_base[off2] = val;
+    sfa_row_base[off3] = val;
+  }
+  __syncthreads();
+
+  const __nv_fp8_e4m3* src = hidden_states + tid_src * K1;
+  __nv_fp8_e4m3*       dst = packed_acts    + m       * K1;
+  const uint4* src_v = reinterpret_cast<const uint4*>(src);
+  uint4*       dst_v = reinterpret_cast<uint4*>(dst);
+  int n_v = K1 / 16;
+  for (int i = tid; i < n_v; i += bdim) {
+    int k_start = i * 16;
+    int kb = k_start / 128;
+    float sr = sr_shared[kb];
+    uint4 v = src_v[i];
+    uint8_t* bytes = reinterpret_cast<uint8_t*>(&v);
+    #pragma unroll
+    for (int j = 0; j < 16; ++j) {
+      __nv_fp8_e4m3 fp8v;
+      fp8v.__x = bytes[j];
+      float fv = (float)fp8v;
+      fv *= sr;
+      if (fv >  448.0f) fv =  448.0f;
+      if (fv < -448.0f) fv = -448.0f;
+      __nv_fp8_e4m3 fp8_out(fv);
+      bytes[j] = fp8_out.__x;
+    }
+    dst_v[i] = v;
+  }
+}
+
+void fused_gather_mxf8(
+    torch::Tensor const& hidden_states,
+    torch::Tensor const& hs_scale,
+    torch::Tensor const& sorted_tids,
+    torch::Tensor&       packed_acts,
+    torch::Tensor&       packed_act_scales_ue8m0,
+    torch::Tensor const& expert_offsets,
+    torch::Tensor const& sfa_byte_offsets,
+    torch::Tensor&       sfa_layouts,
+    torch::Tensor&       sfa_buffer)
+{
+  int T = hidden_states.size(0);
+  int K1 = hidden_states.size(1);
+  int K1_blocks = packed_act_scales_ue8m0.size(1);
+  int M = sorted_tids.size(0);
+  int E = expert_offsets.size(0) - 1;
+
+  using Cfg = CfgMxF8Large;
+  using LayoutOut = cutlass::layout::RowMajor;
+  using MxFB = MxF8GemmBuilder<Cfg, LayoutOut>;
+
+  int hs_size_0 = hs_scale.size(0);
+  int hs_size_1 = hs_scale.size(1);
+  int stride_t, stride_b;
+  if (hs_size_0 == K1_blocks && hs_size_1 == T) {
+    stride_t = hs_scale.stride(1);
+    stride_b = hs_scale.stride(0);
+  } else if (hs_size_0 == T && hs_size_1 == K1_blocks) {
+    stride_t = hs_scale.stride(0);
+    stride_b = hs_scale.stride(1);
+  } else {
+    TORCH_CHECK(false, "hs_scale shape doesn't match either [T, K/128] or [K/128, T]");
+  }
+
+  auto stream = at::cuda::getCurrentCUDAStream(hidden_states.get_device()).stream();
+  size_t smem_bytes = K1_blocks * sizeof(float);
+  fused_gather_mxf8_kernel<Cfg, LayoutOut><<<M, 256, smem_bytes, stream>>>(
+      reinterpret_cast<const __nv_fp8_e4m3*>(hidden_states.data_ptr()),
+      hs_scale.data_ptr<float>(),
+      stride_t, stride_b,
+      sorted_tids.data_ptr<int>(),
+      reinterpret_cast<__nv_fp8_e4m3*>(packed_acts.data_ptr()),
+      packed_act_scales_ue8m0.data_ptr<float>(),
+      T, K1, K1_blocks,
+      expert_offsets.data_ptr<int>(),
+      sfa_byte_offsets.data_ptr<int>(),
+      reinterpret_cast<typename MxFB::InternalLayoutSFA*>(sfa_layouts.data_ptr()),
+      E,
+      reinterpret_cast<cutlass::float_ue8m0_t*>(sfa_buffer.data_ptr()));
 }
 
 // Dedicated weight-transcode kernel: per-expert, per-output-row, per-k-block.
@@ -854,45 +1515,91 @@ void mxf8_transcode_weights_impl(
 // pre-computed cache: for each expert we store the LAYOUT struct, then the
 // kernel evaluates the layout in-place (simple `layout(m, k, 0)` call).
 // ============================================================================
+// Pack SFA with one block per global_token. Each block has 128 threads and
+// iterates K_blocks_128 sub-K blocks: each thread processes one (m, kb) pair
+// from a chunk. This reduces block count from (K_blocks * total_tokens) to
+// just `total_tokens` blocks — far less launch-scheduler pressure.
 template <typename Cfg, typename LayoutOut>
-__global__ void pack_sfa_per_expert_kernel(
+__global__ void pack_sfa_global_kernel(
     const float* __restrict__ scale_fp32,      // [M, K/128] per-token pow2 fp32
-    const int* __restrict__ expert_offsets,     // [E]
+    const int* __restrict__ expert_offsets,     // [E+1] inclusive-scan
     const int* __restrict__ sfa_byte_offsets,   // [E+1]
     typename MxF8GemmBuilder<Cfg, LayoutOut>::InternalLayoutSFA* layouts,  // [E]
-    typename MxF8GemmBuilder<Cfg, LayoutOut>::Sm1xxBlkScaledConfig::SfAtom sfatom,
-    int K,
+    int total_tokens,
     int K_blocks_128,  // K/128
-    cutlass::float_ue8m0_t* sfa_out  // flat UE8M0 output, per-expert regions
+    int E,
+    cutlass::float_ue8m0_t* sfa_out
 ) {
-  using MxFB = MxF8GemmBuilder<Cfg, LayoutOut>;
+  int global_m = blockIdx.x;
+  int tid      = threadIdx.x;
+  if (global_m >= total_tokens) return;
 
-  int e  = blockIdx.z;
-  int m  = blockIdx.y;        // local m within expert
-  int kb = blockIdx.x;        // K-block-128 index
-  int tid = threadIdx.x;
+  // Find which expert this token belongs to (E<=32; linear scan is fine).
+  int e = 0;
+  #pragma unroll
+  for (int ee = 0; ee < 64; ++ee) {
+    if (ee >= E) break;
+    if (global_m < expert_offsets[ee + 1]) { e = ee; break; }
+  }
+  int local_m = global_m - expert_offsets[e];
 
-  // m_count = counts[e] = expert_offsets[e+1] - expert_offsets[e]
-  int expert_start = expert_offsets[e];
-  int next_start   = expert_offsets[e + 1];
-  int m_count = next_start - expert_start;
-  if (m >= m_count || kb >= K_blocks_128) return;
-
-  int global_m = expert_start + m;
-  float fp32_val = scale_fp32[global_m * K_blocks_128 + kb];  // pow2 value
-  uint8_t ue8m0_byte = ue8m0_ceil_from_abs_fp32(fp32_val);
-
-  // Per-expert sub-layout.
   auto layout = layouts[e];
   cutlass::float_ue8m0_t* out = sfa_out + sfa_byte_offsets[e];
 
-  // The 128-element K-block corresponds to 4 sub-blocks of 32 elements. Write
-  // the same UE8M0 byte at each of those 4 sub-block positions, at row m.
-  // Layout indexing: layout(m, k, 0) -> offset.
-  for (int sub = tid; sub < 4; sub += blockDim.x) {
-    int k = kb * 128 + sub * 32;
-    int off = layout(m, k, 0);
-    out[off] = cutlass::float_ue8m0_t::bitcast(ue8m0_byte);
+  // Each thread handles one K-block-128.
+  for (int kb = tid; kb < K_blocks_128; kb += blockDim.x) {
+    float fp32_val = scale_fp32[global_m * K_blocks_128 + kb];
+    uint8_t ue8m0_byte = ue8m0_ceil_from_abs_fp32(fp32_val);
+    cutlass::float_ue8m0_t val = cutlass::float_ue8m0_t::bitcast(ue8m0_byte);
+    // 4 sub-blocks of 32 elements each inside the K-128 block; all same byte.
+    int k0 = kb * 128;
+    int off0 = layout(local_m, k0 +  0, 0);
+    int off1 = layout(local_m, k0 + 32, 0);
+    int off2 = layout(local_m, k0 + 64, 0);
+    int off3 = layout(local_m, k0 + 96, 0);
+    out[off0] = val;
+    out[off1] = val;
+    out[off2] = val;
+    out[off3] = val;
+  }
+}
+
+// High-throughput SFB packer: each block processes one (n_block, k_block_128)
+// pair across all experts. SFB is invariant across calls for a given workload
+// (depends only on N, K, E), so this is run ONCE during weight transcode.
+template <typename Cfg, typename LayoutOut>
+__global__ void pack_sfb_global_kernel(
+    const float* __restrict__ scale_fp32,       // [E, N/128, K/128] per-row-block pow2 fp32
+    typename MxF8GemmBuilder<Cfg, LayoutOut>::InternalLayoutSFB* layouts,  // [E]
+    const int* __restrict__ sfb_byte_offsets,   // [E+1]
+    int E, int N, int K,
+    int N_blocks_128,
+    int K_blocks_128,
+    cutlass::float_ue8m0_t* sfb_out)
+{
+  int e  = blockIdx.z;
+  int nb = blockIdx.y;
+  int kb = blockIdx.x;
+  if (nb >= N_blocks_128 || kb >= K_blocks_128 || e >= E) return;
+  int tid = threadIdx.x;
+
+  float fp32_val = scale_fp32[(e * N_blocks_128 + nb) * K_blocks_128 + kb];
+  uint8_t ue8m0_byte = ue8m0_ceil_from_abs_fp32(fp32_val);
+  cutlass::float_ue8m0_t val = cutlass::float_ue8m0_t::bitcast(ue8m0_byte);
+
+  auto layout = layouts[e];
+  cutlass::float_ue8m0_t* out = sfb_out + sfb_byte_offsets[e];
+
+  // Each block writes 128 N-rows × 4 K-sub-blocks = 512 bytes. 128 threads
+  // cooperate: each thread writes 4 bytes (1 per sub-block across its n-row).
+  for (int n_off = tid; n_off < 128; n_off += blockDim.x) {
+    int n = nb * 128 + n_off;
+    if (n >= N) continue;
+    for (int sub = 0; sub < 4; ++sub) {
+      int k = kb * 128 + sub * 32;
+      int off = layout(n, k, 0);
+      out[off] = val;
+    }
   }
 }
 
@@ -927,6 +1634,61 @@ __global__ void pack_sfb_per_expert_kernel(
   }
 }
 
+// Kernel to populate per-expert SFB Layout and byte offset tables for weight-
+// packing. SFB layout depends only on (N, K) for Sm1xx.
+template <typename Cfg, typename LayoutOut>
+__global__ void init_mxf8_sfb_layout_kernel(
+    typename MxF8GemmBuilder<Cfg, LayoutOut>::InternalLayoutSFB* layouts,
+    int* sfb_byte_offsets,
+    int N, int K, int E)
+{
+  using MxFB = MxF8GemmBuilder<Cfg, LayoutOut>;
+  using SfConfig = typename MxFB::Sm1xxBlkScaledConfig;
+  int e = threadIdx.x;
+  if (e >= E) return;
+  layouts[e] = SfConfig::tile_atom_to_shape_SFB(cute::make_shape(128, N, K, 1));
+  int sz_e = ((N + 127) / 128) * 128 * (((K + 31) / 32) * 4);
+  __syncthreads();
+  if (e == 0) {
+    int acc = 0;
+    sfb_byte_offsets[0] = 0;
+    for (int i = 0; i < E; ++i) {
+      acc += sz_e;
+      sfb_byte_offsets[i + 1] = acc;
+    }
+  }
+}
+
+void mxf8_pack_weight_sfb_impl(
+    torch::Tensor const& scale_ue8m0_fp32,
+    torch::Tensor& sfb_layouts,
+    torch::Tensor& sfb_byte_offsets,
+    torch::Tensor& sfb_buffer,
+    int N, int K)
+{
+  using Cfg = CfgMxF8Large;
+  using LayoutOut = cutlass::layout::RowMajor;
+  using MxFB = MxF8GemmBuilder<Cfg, LayoutOut>;
+
+  int E = scale_ue8m0_fp32.size(0);
+  int N_blocks = scale_ue8m0_fp32.size(1);
+  int K_blocks = scale_ue8m0_fp32.size(2);
+  auto stream = at::cuda::getCurrentCUDAStream(scale_ue8m0_fp32.get_device()).stream();
+
+  init_mxf8_sfb_layout_kernel<Cfg, LayoutOut><<<1, 64, 0, stream>>>(
+      reinterpret_cast<typename MxFB::InternalLayoutSFB*>(sfb_layouts.data_ptr()),
+      sfb_byte_offsets.data_ptr<int>(),
+      N, K, E);
+
+  dim3 grid(K_blocks, N_blocks, E);
+  pack_sfb_global_kernel<Cfg, LayoutOut><<<grid, 128, 0, stream>>>(
+      scale_ue8m0_fp32.data_ptr<float>(),
+      reinterpret_cast<typename MxFB::InternalLayoutSFB*>(sfb_layouts.data_ptr()),
+      sfb_byte_offsets.data_ptr<int>(),
+      E, N, K, N_blocks, K_blocks,
+      reinterpret_cast<cutlass::float_ue8m0_t*>(sfb_buffer.data_ptr()));
+}
+
 // ============================================================================
 // Main MxF8 MoE grouped GEMM entry. Same interface as moe_blockwise_grouped_mm_v2
 // but expects `scales_a`, `scales_b` to be POW-OF-2 fp32 values (from the
@@ -935,6 +1697,195 @@ __global__ void pack_sfb_per_expert_kernel(
 // sfa_byte_offsets[E+1] and sfb_byte_offsets[E+1] based on problem_sizes[e]
 // and the per-expert layout size.
 // ============================================================================
+// Generic-Cfg variant for GEMM config experiments.
+template <typename Cfg>
+void moe_mxf8_grouped_mm_prepacked_cfg(
+    torch::Tensor& output,
+    torch::Tensor const& a,
+    torch::Tensor const& b,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor& a_ptrs,
+    torch::Tensor& b_ptrs,
+    torch::Tensor& out_ptrs,
+    torch::Tensor& sfa_ptrs,
+    torch::Tensor& sfb_ptrs,
+    torch::Tensor const& stride_a,
+    torch::Tensor const& stride_b,
+    torch::Tensor const& stride_c,
+    torch::Tensor& layout_sfa,
+    torch::Tensor& layout_sfb,
+    torch::Tensor const& workspace)
+{
+  int E = b.size(0);
+  using LayoutOut = cutlass::layout::RowMajor;
+  auto stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
+  launch_mxf8_group_gemm<Cfg, LayoutOut>(
+      a_ptrs, b_ptrs, out_ptrs, sfa_ptrs, sfb_ptrs,
+      stride_a, stride_b, stride_c,
+      layout_sfa, layout_sfb,
+      problem_sizes, workspace, E, stream);
+}
+
+void moe_mxf8_grouped_mm_prepacked_256_256(
+    torch::Tensor& output, torch::Tensor const& a, torch::Tensor const& b,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor& a_ptrs, torch::Tensor& b_ptrs, torch::Tensor& out_ptrs,
+    torch::Tensor& sfa_ptrs, torch::Tensor& sfb_ptrs,
+    torch::Tensor const& stride_a, torch::Tensor const& stride_b, torch::Tensor const& stride_c,
+    torch::Tensor& layout_sfa, torch::Tensor& layout_sfb,
+    torch::Tensor const& workspace)
+{
+  moe_mxf8_grouped_mm_prepacked_cfg<CfgMxF8G2_256_256>(
+      output, a, b, problem_sizes,
+      a_ptrs, b_ptrs, out_ptrs, sfa_ptrs, sfb_ptrs,
+      stride_a, stride_b, stride_c,
+      layout_sfa, layout_sfb, workspace);
+}
+
+void moe_mxf8_grouped_mm_prepacked_128_256_1sm(
+    torch::Tensor& output, torch::Tensor const& a, torch::Tensor const& b,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor& a_ptrs, torch::Tensor& b_ptrs, torch::Tensor& out_ptrs,
+    torch::Tensor& sfa_ptrs, torch::Tensor& sfb_ptrs,
+    torch::Tensor const& stride_a, torch::Tensor const& stride_b, torch::Tensor const& stride_c,
+    torch::Tensor& layout_sfa, torch::Tensor& layout_sfb,
+    torch::Tensor const& workspace)
+{
+  moe_mxf8_grouped_mm_prepacked_cfg<CfgMxF8G2_128_256_1SM>(
+      output, a, b, problem_sizes,
+      a_ptrs, b_ptrs, out_ptrs, sfa_ptrs, sfb_ptrs,
+      stride_a, stride_b, stride_c,
+      layout_sfa, layout_sfb, workspace);
+}
+
+// 1SM variant: launches the CUTLASS MxF8 GEMM with CfgMxF8Large1SM
+// (tile 128×128×128, cluster 1×1×1). Accepts the same Arguments structs
+// as the 2SM variant because the mainloop layouts/strides only depend on
+// the scale config + problem shape (both fixed for MxF8).
+void moe_mxf8_grouped_mm_prepacked_1sm(
+    torch::Tensor& output,
+    torch::Tensor const& a,
+    torch::Tensor const& b,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor& a_ptrs,
+    torch::Tensor& b_ptrs,
+    torch::Tensor& out_ptrs,
+    torch::Tensor& sfa_ptrs,
+    torch::Tensor& sfb_ptrs,
+    torch::Tensor const& stride_a,
+    torch::Tensor const& stride_b,
+    torch::Tensor const& stride_c,
+    torch::Tensor& layout_sfa,
+    torch::Tensor& layout_sfb,
+    torch::Tensor const& workspace)
+{
+  int E = b.size(0);
+  using Cfg = CfgMxF8Large1SM;
+  using LayoutOut = cutlass::layout::RowMajor;
+  auto stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
+  launch_mxf8_group_gemm<Cfg, LayoutOut>(
+      a_ptrs, b_ptrs, out_ptrs, sfa_ptrs, sfb_ptrs,
+      stride_a, stride_b, stride_c,
+      layout_sfa, layout_sfb,
+      problem_sizes, workspace, E, stream);
+}
+
+// CUTLASS-only launch (no setup, no pack). Used when ptrs/layouts/SFA/SFB
+// have been fully pre-populated (e.g., by moe_mxf8_setup_ptrs +
+// mxf8_transcode_and_pack_sfa + mxf8_pack_weight_sfb_impl). Avoids env-var
+// checks and extra kernel launches.
+//
+// Tile config defaults to 256×256×128 2SM (experimentally 18% faster on both
+// GEMMs of the contest shape vs prior 256×128×128 default, bit-identical
+// output). Override via env var `MXF8_TILE=256_128` for the old config.
+void moe_mxf8_grouped_mm_prepacked(
+    torch::Tensor& output,
+    torch::Tensor const& a,
+    torch::Tensor const& b,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor& a_ptrs,
+    torch::Tensor& b_ptrs,
+    torch::Tensor& out_ptrs,
+    torch::Tensor& sfa_ptrs,
+    torch::Tensor& sfb_ptrs,
+    torch::Tensor const& stride_a,
+    torch::Tensor const& stride_b,
+    torch::Tensor const& stride_c,
+    torch::Tensor& layout_sfa,
+    torch::Tensor& layout_sfb,
+    torch::Tensor const& workspace)
+{
+  int E = b.size(0);
+  using LayoutOut = cutlass::layout::RowMajor;
+  auto stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
+  const char* tile_env = std::getenv("MXF8_TILE");
+  bool use_old_tile = tile_env && std::string(tile_env) == "256_128";
+  if (use_old_tile) {
+    launch_mxf8_group_gemm<CfgMxF8Large, LayoutOut>(
+        a_ptrs, b_ptrs, out_ptrs, sfa_ptrs, sfb_ptrs,
+        stride_a, stride_b, stride_c,
+        layout_sfa, layout_sfb,
+        problem_sizes, workspace, E, stream);
+  } else {
+    launch_mxf8_group_gemm<CfgMxF8G2_256_256, LayoutOut>(
+        a_ptrs, b_ptrs, out_ptrs, sfa_ptrs, sfb_ptrs,
+        stride_a, stride_b, stride_c,
+        layout_sfa, layout_sfb,
+        problem_sizes, workspace, E, stream);
+  }
+}
+
+// Separable ptr-setup: populates a_ptrs, b_ptrs, out_ptrs, strides, and
+// per-expert layout_sfa/layout_sfb. Used by callers that want to fuse SFA
+// packing into an earlier kernel (transcode+pack fusion).
+void moe_mxf8_setup_ptrs(
+    torch::Tensor& output,
+    torch::Tensor const& a,
+    torch::Tensor const& b,
+    torch::Tensor const& expert_offsets,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor& a_ptrs,
+    torch::Tensor& b_ptrs,
+    torch::Tensor& out_ptrs,
+    torch::Tensor& sfa_ptrs,
+    torch::Tensor& sfb_ptrs,
+    torch::Tensor& stride_a,
+    torch::Tensor& stride_b,
+    torch::Tensor& stride_c,
+    torch::Tensor& layout_sfa,
+    torch::Tensor& layout_sfb,
+    torch::Tensor& sfa_buffer,
+    torch::Tensor& sfb_buffer,
+    torch::Tensor const& sfa_byte_offsets,
+    torch::Tensor const& sfb_byte_offsets)
+{
+  int E = b.size(0);
+  using Cfg = CfgMxF8Large;
+  using LayoutOut = cutlass::layout::RowMajor;
+  using MxFB = MxF8GemmBuilder<Cfg, LayoutOut>;
+  auto stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
+  get_group_gemm_starts_kernel_mxf8<Cfg, LayoutOut><<<1, E, 0, stream>>>(
+      expert_offsets.data_ptr<int>(),
+      sfa_byte_offsets.data_ptr<int>(),
+      sfb_byte_offsets.data_ptr<int>(),
+      static_cast<ElementAB**>(a_ptrs.data_ptr()),
+      static_cast<ElementAB**>(b_ptrs.data_ptr()),
+      static_cast<ElementC**>(out_ptrs.data_ptr()),
+      static_cast<ElementSF_mx**>(sfa_ptrs.data_ptr()),
+      static_cast<ElementSF_mx**>(sfb_ptrs.data_ptr()),
+      static_cast<ElementAB*>(const_cast<void*>(a.data_ptr())),
+      static_cast<ElementAB*>(const_cast<void*>(b.data_ptr())),
+      static_cast<ElementC*>(output.data_ptr()),
+      reinterpret_cast<ElementSF_mx*>(sfa_buffer.data_ptr()),
+      reinterpret_cast<ElementSF_mx*>(sfb_buffer.data_ptr()),
+      reinterpret_cast<typename MxFB::InternalLayoutSFA*>(layout_sfa.data_ptr()),
+      reinterpret_cast<typename MxFB::InternalLayoutSFB*>(layout_sfb.data_ptr()),
+      reinterpret_cast<typename MxFB::StrideA*>(const_cast<void*>(stride_a.data_ptr())),
+      reinterpret_cast<typename MxFB::StrideB*>(const_cast<void*>(stride_b.data_ptr())),
+      reinterpret_cast<typename MxFB::StrideC*>(const_cast<void*>(stride_c.data_ptr())),
+      problem_sizes.data_ptr<int>());
+}
+
 void moe_mxf8_grouped_mm(
     torch::Tensor& output,           // [total_tokens, N] bf16
     torch::Tensor const& a,          // [total_tokens, K] fp8 (transcoded)
@@ -973,38 +1924,20 @@ void moe_mxf8_grouped_mm(
 
   auto stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
 
-  // 1) Pack fp32 pow2 scales into UE8M0 layout per expert.
-  // SFA: per-token, SFB: per-128-row-block.
-  dim3 sfa_grid(K / 128, total_tokens / E + 1, E);  // over-approximates; kernel guards with m_count
-  // Cleaner: grid.y = max per-expert m across all experts; conservative pick total_tokens/E+1.
-  // For correctness we iterate m up to m_count inside the kernel.
-  // Use a single max(m_e) across experts: easier is to just launch total_tokens Y (upper bound of per-expert m).
-  int max_m_per_expert = 0;
-  {
-    auto ps_cpu = problem_sizes.cpu();
-    auto* p = ps_cpu.data_ptr<int32_t>();
-    for (int e = 0; e < E; ++e) max_m_per_expert = std::max(max_m_per_expert, p[e * 3]);
-  }
-  sfa_grid = dim3(K / 128, max_m_per_expert, E);
   typename SfConfig::SfAtom sfatom{};
-  pack_sfa_per_expert_kernel<Cfg, LayoutOut><<<sfa_grid, 4, 0, stream>>>(
-      scales_a.data_ptr<float>(),
-      expert_offsets.data_ptr<int>(),
-      sfa_byte_offsets.data_ptr<int>(),
-      reinterpret_cast<typename MxFB::InternalLayoutSFA*>(layout_sfa.data_ptr()),
-      sfatom,
-      K, K / 128,
-      reinterpret_cast<cutlass::float_ue8m0_t*>(sfa_buffer.data_ptr()));
+  const char* mxf8_skip = std::getenv("MXF8_SKIP_MODE");
+  bool skip_pack = (mxf8_skip && std::string(mxf8_skip) == "pack");
+  bool skip_gemm = (mxf8_skip && std::string(mxf8_skip) == "gemm");
+  const char* mxf8_pre_sfb = std::getenv("MXF8_PRE_SFB");
+  bool sfb_pre_packed = (mxf8_pre_sfb && std::string(mxf8_pre_sfb) == "1");
+  const char* mxf8_pre_sfa = std::getenv("MXF8_PRE_SFA");
+  bool sfa_pre_packed = (mxf8_pre_sfa && std::string(mxf8_pre_sfa) == "1");
+  const char* mxf8_skip_setup = std::getenv("MXF8_SKIP_SETUP");
+  bool skip_setup = (mxf8_skip_setup && std::string(mxf8_skip_setup) == "1");
 
-  dim3 sfb_grid(K / 128, N, E);
-  pack_sfb_per_expert_kernel<Cfg, LayoutOut><<<sfb_grid, 4, 0, stream>>>(
-      scales_b.data_ptr<float>(),
-      sfb_byte_offsets.data_ptr<int>(),
-      reinterpret_cast<typename MxFB::InternalLayoutSFB*>(layout_sfb.data_ptr()),
-      E, N, K, N / 128, K / 128,
-      reinterpret_cast<cutlass::float_ue8m0_t*>(sfb_buffer.data_ptr()));
-
-  // 2) Build ptr arrays, strides, per-expert layouts.
+  // 1) Build ptr arrays, strides, per-expert layouts (FIRST - pack kernels below
+  //    use the per-expert layout structures written here).
+  if (!skip_setup)
   get_group_gemm_starts_kernel_mxf8<Cfg, LayoutOut><<<1, E, 0, stream>>>(
       expert_offsets.data_ptr<int>(),
       sfa_byte_offsets.data_ptr<int>(),
@@ -1026,7 +1959,31 @@ void moe_mxf8_grouped_mm(
       reinterpret_cast<typename MxFB::StrideC*>(const_cast<void*>(stride_c.data_ptr())),
       problem_sizes.data_ptr<int>());
 
+  // 2) Pack fp32 pow2 scales into UE8M0 layout per expert. Single grid over all
+  //    global tokens (no CPU sync), each block = 128 threads processing all
+  //    K-blocks-128 for one row.
+  if (!skip_pack && !sfa_pre_packed) {
+    pack_sfa_global_kernel<Cfg, LayoutOut><<<total_tokens, 128, 0, stream>>>(
+        scales_a.data_ptr<float>(),
+        expert_offsets.data_ptr<int>(),
+        sfa_byte_offsets.data_ptr<int>(),
+        reinterpret_cast<typename MxFB::InternalLayoutSFA*>(layout_sfa.data_ptr()),
+        total_tokens, K / 128, E,
+        reinterpret_cast<cutlass::float_ue8m0_t*>(sfa_buffer.data_ptr()));
+
+    if (!sfb_pre_packed) {
+      dim3 sfb_grid(K / 128, N, E);
+      pack_sfb_per_expert_kernel<Cfg, LayoutOut><<<sfb_grid, 4, 0, stream>>>(
+          scales_b.data_ptr<float>(),
+          sfb_byte_offsets.data_ptr<int>(),
+          reinterpret_cast<typename MxFB::InternalLayoutSFB*>(layout_sfb.data_ptr()),
+          E, N, K, N / 128, K / 128,
+          reinterpret_cast<cutlass::float_ue8m0_t*>(sfb_buffer.data_ptr()));
+    }
+  }
+
   // 3) Launch CUTLASS MxF8 grouped GEMM.
+  if (skip_gemm) return;
   launch_mxf8_group_gemm<Cfg, LayoutOut>(
       a_ptrs, b_ptrs, out_ptrs, sfa_ptrs, sfb_ptrs,
       stride_a, stride_b, stride_c,
@@ -1057,6 +2014,56 @@ compute_mxf8_sfa_layout_offsets_host(torch::Tensor const& problem_sizes) {
     offsets[e + 1] = offsets[e] + size_e;
   }
   return {offsets, offsets.back()};
+}
+
+// Device-side inclusive scan of per-expert SFA/SFB byte-sizes. Size formula:
+// SFA bytes/expert = ceil(M_e/128)*128 * ceil(K/32)*4
+// SFB bytes/expert = ceil(N/128)*128 * ceil(K/32)*4
+// Single-block, single-warp kernel over E experts (E=32 in contest).
+__global__ void compute_mxf8_sf_offsets_kernel(
+    int32_t const* __restrict__ problem_sizes,   // [E, 3] (M, N, K)
+    int32_t* __restrict__ sfa_offsets,           // [E+1]
+    int32_t* __restrict__ sfb_offsets,           // [E+1]
+    int E)
+{
+  int tid = threadIdx.x;
+  __shared__ int32_t sfa_sz[64];
+  __shared__ int32_t sfb_sz[64];
+  if (tid < E) {
+    int m_e = problem_sizes[tid * 3 + 0];
+    int n_e = problem_sizes[tid * 3 + 1];
+    int k_e = problem_sizes[tid * 3 + 2];
+    int k32 = ((k_e + 31) / 32) * 4;
+    sfa_sz[tid] = ((m_e + 127) / 128) * 128 * k32;
+    sfb_sz[tid] = ((n_e + 127) / 128) * 128 * k32;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    int32_t ca = 0, cb = 0;
+    sfa_offsets[0] = 0;
+    sfb_offsets[0] = 0;
+    for (int e = 0; e < E; ++e) {
+      ca += sfa_sz[e];
+      cb += sfb_sz[e];
+      sfa_offsets[e + 1] = ca;
+      sfb_offsets[e + 1] = cb;
+    }
+  }
+}
+
+void compute_mxf8_sf_offsets_device(
+    torch::Tensor const& problem_sizes,
+    torch::Tensor& sfa_offsets,
+    torch::Tensor& sfb_offsets)
+{
+  int E = problem_sizes.size(0);
+  TORCH_CHECK(E <= 64, "E must be <= 64 in device offset kernel");
+  auto stream = at::cuda::getCurrentCUDAStream(problem_sizes.get_device()).stream();
+  compute_mxf8_sf_offsets_kernel<<<1, 64, 0, stream>>>(
+      problem_sizes.data_ptr<int32_t>(),
+      sfa_offsets.data_ptr<int32_t>(),
+      sfb_offsets.data_ptr<int32_t>(),
+      E);
 }
 
 std::tuple<std::vector<int32_t>, int64_t>
@@ -1103,6 +2110,135 @@ int64_t get_mxf8_sizes_layout_sfb() {
   using LayoutOut = cutlass::layout::RowMajor;
   using MxFB = MxF8GemmBuilder<Cfg, LayoutOut>;
   return sizeof(typename MxFB::InternalLayoutSFB);
+}
+
+// Size + layout helpers for the FP8-output builder.
+int64_t get_mxf8_fp8out_sizes_stride() {
+  using Cfg = CfgMxF8Large1SM;
+  using LayoutOut = cutlass::layout::RowMajor;
+  using MxFB = MxF8GemmBuilderFP8Out<Cfg, LayoutOut>;
+  return std::max({
+      sizeof(typename MxFB::StrideA), sizeof(typename MxFB::StrideB), sizeof(typename MxFB::StrideD)
+  });
+}
+int64_t get_mxf8_fp8out_sizes_layout_sfd() {
+  using Cfg = CfgMxF8Large1SM;
+  using LayoutOut = cutlass::layout::RowMajor;
+  using MxFB = MxF8GemmBuilderFP8Out<Cfg, LayoutOut>;
+  return sizeof(typename MxFB::LayoutSFD);
+}
+
+// Compute SFD byte-offsets on device.
+__global__ void compute_mxf8_sfd_offsets_kernel(
+    int32_t const* __restrict__ problem_sizes,
+    int32_t* __restrict__ sfd_offsets,
+    int E)
+{
+  int tid = threadIdx.x;
+  __shared__ int32_t sfd_sz[64];
+  if (tid < E) {
+    int m_e = problem_sizes[tid * 3 + 0];
+    int n_e = problem_sizes[tid * 3 + 1];
+    // SFD size formula for fp8 output with sf_vec_size=32:
+    // ceil(M/128)*128 * ceil(N/32)*4 bytes
+    int n32 = ((n_e + 31) / 32) * 4;
+    sfd_sz[tid] = ((m_e + 127) / 128) * 128 * n32;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    int32_t c = 0;
+    sfd_offsets[0] = 0;
+    for (int e = 0; e < E; ++e) {
+      c += sfd_sz[e];
+      sfd_offsets[e + 1] = c;
+    }
+  }
+}
+
+void compute_mxf8_sfd_offsets_device(
+    torch::Tensor const& problem_sizes,
+    torch::Tensor& sfd_offsets)
+{
+  int E = problem_sizes.size(0);
+  TORCH_CHECK(E <= 64, "E must be <= 64");
+  auto stream = at::cuda::getCurrentCUDAStream(problem_sizes.get_device()).stream();
+  compute_mxf8_sfd_offsets_kernel<<<1, 64, 0, stream>>>(
+      problem_sizes.data_ptr<int32_t>(),
+      sfd_offsets.data_ptr<int32_t>(),
+      E);
+}
+
+// FP8-output grouped MxF8 GEMM entry point. Same interface as
+// moe_mxf8_grouped_mm_prepacked but writes fp8+ue8m0-scales instead of bf16.
+// Caller must pre-pack SFA (activations) and SFB (weights). Output D has
+// shape [total_tokens, N] fp8 and SFD has shape [E, tile-layout] ue8m0.
+void moe_mxf8_grouped_mm_prepacked_fp8out(
+    torch::Tensor& output_fp8,           // [total_tokens, N] fp8_e4m3
+    torch::Tensor& output_sfd,           // flat UE8M0 buffer sized by compute_mxf8_sfd_offsets
+    torch::Tensor const& sfd_byte_offsets,  // [E+1] int32
+    torch::Tensor const& a,              // [total_tokens, K] fp8
+    torch::Tensor const& b,              // [E, N, K] fp8
+    torch::Tensor const& problem_sizes,  // [E, 3]
+    torch::Tensor const& expert_offsets, // [E+1]
+    torch::Tensor& a_ptrs,
+    torch::Tensor& b_ptrs,
+    torch::Tensor& d_ptrs,
+    torch::Tensor& sfd_ptrs,
+    torch::Tensor& sfa_ptrs,
+    torch::Tensor& sfb_ptrs,
+    torch::Tensor const& sfa_byte_offsets,
+    torch::Tensor const& sfb_byte_offsets,
+    torch::Tensor& sfa_buffer,
+    torch::Tensor& sfb_buffer,
+    torch::Tensor& stride_a,
+    torch::Tensor& stride_b,
+    torch::Tensor& stride_d,
+    torch::Tensor& layout_sfa,
+    torch::Tensor& layout_sfb,
+    torch::Tensor& layout_sfd,
+    torch::Tensor const& workspace)
+{
+  int E = b.size(0);
+  // FP8-out path uses 1SM config; block-scaled epilogue has non-trivial per-tile
+  // amax-reduction + quantization work that benefits from less cluster pressure.
+  using Cfg = CfgMxF8Large1SM;
+  using LayoutOut = cutlass::layout::RowMajor;
+  using MxFB = MxF8GemmBuilderFP8Out<Cfg, LayoutOut>;
+
+  auto stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
+
+  // 1) Populate per-expert ptrs, strides, and layouts (SFA/SFB/SFD).
+  get_group_gemm_starts_kernel_mxf8_fp8out<Cfg, LayoutOut><<<1, E, 0, stream>>>(
+      expert_offsets.data_ptr<int>(),
+      sfa_byte_offsets.data_ptr<int>(),
+      sfb_byte_offsets.data_ptr<int>(),
+      sfd_byte_offsets.data_ptr<int>(),
+      static_cast<ElementAB**>(a_ptrs.data_ptr()),
+      static_cast<ElementAB**>(b_ptrs.data_ptr()),
+      static_cast<ElementD_FP8**>(d_ptrs.data_ptr()),
+      static_cast<ElementSFD**>(sfd_ptrs.data_ptr()),
+      static_cast<ElementSF_mx**>(sfa_ptrs.data_ptr()),
+      static_cast<ElementSF_mx**>(sfb_ptrs.data_ptr()),
+      static_cast<ElementAB*>(const_cast<void*>(a.data_ptr())),
+      static_cast<ElementAB*>(const_cast<void*>(b.data_ptr())),
+      static_cast<ElementD_FP8*>(output_fp8.data_ptr()),
+      static_cast<ElementSFD*>(output_sfd.data_ptr()),
+      reinterpret_cast<ElementSF_mx*>(sfa_buffer.data_ptr()),
+      reinterpret_cast<ElementSF_mx*>(sfb_buffer.data_ptr()),
+      reinterpret_cast<typename MxFB::InternalLayoutSFA*>(layout_sfa.data_ptr()),
+      reinterpret_cast<typename MxFB::InternalLayoutSFB*>(layout_sfb.data_ptr()),
+      reinterpret_cast<typename MxFB::LayoutSFD*>(layout_sfd.data_ptr()),
+      reinterpret_cast<typename MxFB::StrideA*>(const_cast<void*>(stride_a.data_ptr())),
+      reinterpret_cast<typename MxFB::StrideB*>(const_cast<void*>(stride_b.data_ptr())),
+      reinterpret_cast<typename MxFB::StrideD*>(const_cast<void*>(stride_d.data_ptr())),
+      problem_sizes.data_ptr<int>());
+
+  // 2) Launch.
+  launch_mxf8_group_gemm_fp8out<Cfg, LayoutOut>(
+      a_ptrs, b_ptrs, d_ptrs, sfd_ptrs, sfa_ptrs, sfb_ptrs,
+      stride_a, stride_b, stride_d,
+      layout_sfa, layout_sfb, layout_sfd,
+      problem_sizes, workspace, E, stream);
 }
 
 // Debug helper: evaluate SFA layout at a few (m, k) points on the host and
@@ -1205,7 +2341,118 @@ int64_t get_workspace_size(int max_total_tokens, int E, int N, int K, bool use_s
 
 // v18 MxF8 transcode forward decls.
 void mxf8_transcode_activations(torch::Tensor& payload, torch::Tensor const& scale, torch::Tensor& scale_abs);
+void mxf8_transcode_and_pack_sfa(torch::Tensor& payload, torch::Tensor const& scale,
+                                  torch::Tensor& scale_abs,
+                                  torch::Tensor const& expert_offsets,
+                                  torch::Tensor const& sfa_byte_offsets,
+                                  torch::Tensor& sfa_layouts,
+                                  torch::Tensor& sfa_buffer);
 void mxf8_transcode_weights_impl(torch::Tensor& payload, torch::Tensor const& scale, torch::Tensor& scale_abs);
+void mxf8_pack_weight_sfb_impl(torch::Tensor const& scale_ue8m0_fp32,
+                                torch::Tensor& sfb_layouts,
+                                torch::Tensor& sfb_byte_offsets,
+                                torch::Tensor& sfb_buffer,
+                                int N, int K);
+void moe_mxf8_setup_ptrs(torch::Tensor& output,
+                          torch::Tensor const& a,
+                          torch::Tensor const& b,
+                          torch::Tensor const& expert_offsets,
+                          torch::Tensor const& problem_sizes,
+                          torch::Tensor& a_ptrs,
+                          torch::Tensor& b_ptrs,
+                          torch::Tensor& out_ptrs,
+                          torch::Tensor& sfa_ptrs,
+                          torch::Tensor& sfb_ptrs,
+                          torch::Tensor& stride_a,
+                          torch::Tensor& stride_b,
+                          torch::Tensor& stride_c,
+                          torch::Tensor& layout_sfa,
+                          torch::Tensor& layout_sfb,
+                          torch::Tensor& sfa_buffer,
+                          torch::Tensor& sfb_buffer,
+                          torch::Tensor const& sfa_byte_offsets,
+                          torch::Tensor const& sfb_byte_offsets);
+void swiglu_fp8_requant_weighted_mxf8(torch::Tensor const& gemm1_out,
+                                       torch::Tensor const& sorted_weights,
+                                       torch::Tensor& act_q,
+                                       torch::Tensor& row_scales,
+                                       torch::Tensor& broadcast_scales_ue8m0,
+                                       torch::Tensor const& expert_offsets,
+                                       torch::Tensor const& sfa_byte_offsets,
+                                       torch::Tensor& sfa_layouts,
+                                       torch::Tensor& sfa_buffer);
+void fused_gather_mxf8(torch::Tensor const& hidden_states,
+                        torch::Tensor const& hs_scale,
+                        torch::Tensor const& sorted_tids,
+                        torch::Tensor& packed_acts,
+                        torch::Tensor& packed_act_scales_ue8m0,
+                        torch::Tensor const& expert_offsets,
+                        torch::Tensor const& sfa_byte_offsets,
+                        torch::Tensor& sfa_layouts,
+                        torch::Tensor& sfa_buffer);
+void moe_mxf8_grouped_mm_prepacked_1sm(
+    torch::Tensor& output,
+    torch::Tensor const& a,
+    torch::Tensor const& b,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor& a_ptrs,
+    torch::Tensor& b_ptrs,
+    torch::Tensor& out_ptrs,
+    torch::Tensor& sfa_ptrs,
+    torch::Tensor& sfb_ptrs,
+    torch::Tensor const& stride_a,
+    torch::Tensor const& stride_b,
+    torch::Tensor const& stride_c,
+    torch::Tensor& layout_sfa,
+    torch::Tensor& layout_sfb,
+    torch::Tensor const& workspace);
+void moe_mxf8_grouped_mm_prepacked_256_256(
+    torch::Tensor& output, torch::Tensor const& a, torch::Tensor const& b,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor& a_ptrs, torch::Tensor& b_ptrs, torch::Tensor& out_ptrs,
+    torch::Tensor& sfa_ptrs, torch::Tensor& sfb_ptrs,
+    torch::Tensor const& stride_a, torch::Tensor const& stride_b, torch::Tensor const& stride_c,
+    torch::Tensor& layout_sfa, torch::Tensor& layout_sfb,
+    torch::Tensor const& workspace);
+void moe_mxf8_grouped_mm_prepacked_128_256_1sm(
+    torch::Tensor& output, torch::Tensor const& a, torch::Tensor const& b,
+    torch::Tensor const& problem_sizes,
+    torch::Tensor& a_ptrs, torch::Tensor& b_ptrs, torch::Tensor& out_ptrs,
+    torch::Tensor& sfa_ptrs, torch::Tensor& sfb_ptrs,
+    torch::Tensor const& stride_a, torch::Tensor const& stride_b, torch::Tensor const& stride_c,
+    torch::Tensor& layout_sfa, torch::Tensor& layout_sfb,
+    torch::Tensor const& workspace);
+int64_t get_mxf8_fp8out_sizes_stride();
+int64_t get_mxf8_fp8out_sizes_layout_sfd();
+void compute_mxf8_sfd_offsets_device(torch::Tensor const&, torch::Tensor&);
+void moe_mxf8_grouped_mm_prepacked_fp8out(
+    torch::Tensor& output_fp8, torch::Tensor& output_sfd,
+    torch::Tensor const& sfd_byte_offsets,
+    torch::Tensor const& a, torch::Tensor const& b,
+    torch::Tensor const& problem_sizes, torch::Tensor const& expert_offsets,
+    torch::Tensor& a_ptrs, torch::Tensor& b_ptrs,
+    torch::Tensor& d_ptrs, torch::Tensor& sfd_ptrs,
+    torch::Tensor& sfa_ptrs, torch::Tensor& sfb_ptrs,
+    torch::Tensor const& sfa_byte_offsets, torch::Tensor const& sfb_byte_offsets,
+    torch::Tensor& sfa_buffer, torch::Tensor& sfb_buffer,
+    torch::Tensor& stride_a, torch::Tensor& stride_b, torch::Tensor& stride_d,
+    torch::Tensor& layout_sfa, torch::Tensor& layout_sfb, torch::Tensor& layout_sfd,
+    torch::Tensor const& workspace);
+void moe_mxf8_grouped_mm_prepacked(torch::Tensor& output,
+                                    torch::Tensor const& a,
+                                    torch::Tensor const& b,
+                                    torch::Tensor const& problem_sizes,
+                                    torch::Tensor& a_ptrs,
+                                    torch::Tensor& b_ptrs,
+                                    torch::Tensor& out_ptrs,
+                                    torch::Tensor& sfa_ptrs,
+                                    torch::Tensor& sfb_ptrs,
+                                    torch::Tensor const& stride_a,
+                                    torch::Tensor const& stride_b,
+                                    torch::Tensor const& stride_c,
+                                    torch::Tensor& layout_sfa,
+                                    torch::Tensor& layout_sfb,
+                                    torch::Tensor const& workspace);
 void moe_mxf8_grouped_mm(
     torch::Tensor& output, torch::Tensor const& a, torch::Tensor const& b,
     torch::Tensor const& scales_a, torch::Tensor const& scales_b,
@@ -1219,6 +2466,7 @@ void moe_mxf8_grouped_mm(
     torch::Tensor const& workspace);
 std::tuple<std::vector<int32_t>, int64_t> compute_mxf8_sfa_layout_offsets_host(torch::Tensor const&);
 std::tuple<std::vector<int32_t>, int64_t> compute_mxf8_sfb_layout_offsets_host(torch::Tensor const&);
+void compute_mxf8_sf_offsets_device(torch::Tensor const&, torch::Tensor&, torch::Tensor&);
 int64_t get_mxf8_sizes_stride();
 int64_t get_mxf8_sizes_layout_sfa();
 int64_t get_mxf8_sizes_layout_sfb();
@@ -1508,6 +2756,116 @@ __global__ void reduce_scatter_unweighted_kernel(
     packed.w = *reinterpret_cast<const uint32_t*>(&r3);
     out_v[j] = packed;
   }
+}
+
+// Fused 2D inverse-bucket build: count + place, single atomicAdd pass.
+// sorted_tids[i] → t; this kernel writes token_perm_2d[t*TOP_K + slot] = i
+// where slot = atomicAdd(token_counts+t, 1). No scan needed.
+__global__ void fused_inverse_bucket_kernel_2d(
+    const int* __restrict__ sorted_tids,
+    int M, int T, int TOP_K,
+    int* __restrict__ token_counts,
+    int* __restrict__ token_perm_2d)
+{
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= M) return;
+  int t = sorted_tids[i];
+  if (t < 0 || t >= T) return;
+  int slot = atomicAdd(token_counts + t, 1);
+  if (slot < TOP_K) {
+    token_perm_2d[t * TOP_K + slot] = i;
+  }
+}
+
+// Reduce kernel that consumes the 2D permutation directly (no offsets).
+// Replaces the previous 4-kernel chain with just this + one fused_inverse_bucket_kernel_2d.
+// Vectorized 128-bit IO matching reduce_scatter_unweighted_kernel.
+__global__ void reduce_scatter_from_2d_perm_kernel(
+    const __nv_bfloat16* __restrict__ gemm2_out,
+    const int*           __restrict__ token_counts,
+    const int*           __restrict__ token_perm_2d,
+    __nv_bfloat16*       __restrict__ out,
+    int T, int N2, int TOP_K)
+{
+  int t = blockIdx.x;
+  if (t >= T) return;
+  int c = token_counts[t];
+  const int TB = blockDim.x;
+  int lane = threadIdx.x;
+
+  const int n_vec = N2 / 8;  // number of uint4 along N
+  uint4* out_v = reinterpret_cast<uint4*>(out + t * N2);
+
+  const int* perm_row = token_perm_2d + t * TOP_K;
+
+  #pragma unroll 2
+  for (int j = lane; j < n_vec; j += TB) {
+    float2 a0 = make_float2(0.f, 0.f);
+    float2 a1 = make_float2(0.f, 0.f);
+    float2 a2 = make_float2(0.f, 0.f);
+    float2 a3 = make_float2(0.f, 0.f);
+    for (int k = 0; k < c; ++k) {
+      int m = perm_row[k];
+      const uint4 v = reinterpret_cast<const uint4*>(gemm2_out + m * N2)[j];
+      __nv_bfloat162 p0 = *reinterpret_cast<const __nv_bfloat162*>(&v.x);
+      __nv_bfloat162 p1 = *reinterpret_cast<const __nv_bfloat162*>(&v.y);
+      __nv_bfloat162 p2 = *reinterpret_cast<const __nv_bfloat162*>(&v.z);
+      __nv_bfloat162 p3 = *reinterpret_cast<const __nv_bfloat162*>(&v.w);
+      a0.x += __bfloat162float(p0.x); a0.y += __bfloat162float(p0.y);
+      a1.x += __bfloat162float(p1.x); a1.y += __bfloat162float(p1.y);
+      a2.x += __bfloat162float(p2.x); a2.y += __bfloat162float(p2.y);
+      a3.x += __bfloat162float(p3.x); a3.y += __bfloat162float(p3.y);
+    }
+    uint4 packed;
+    __nv_bfloat162 r0 = __floats2bfloat162_rn(a0.x, a0.y);
+    __nv_bfloat162 r1 = __floats2bfloat162_rn(a1.x, a1.y);
+    __nv_bfloat162 r2 = __floats2bfloat162_rn(a2.x, a2.y);
+    __nv_bfloat162 r3 = __floats2bfloat162_rn(a3.x, a3.y);
+    packed.x = *reinterpret_cast<const uint32_t*>(&r0);
+    packed.y = *reinterpret_cast<const uint32_t*>(&r1);
+    packed.z = *reinterpret_cast<const uint32_t*>(&r2);
+    packed.w = *reinterpret_cast<const uint32_t*>(&r3);
+    out_v[j] = packed;
+  }
+}
+
+// Merged reduce-scatter: 1 cudaMemset + 2 kernel launches (was 2 memsets + 4 launches).
+// Takes the same buffers as the 4-pass variant, reusing token_perm as the
+// 2D inverse permutation [T, TOP_K]. Requires token_perm.numel() >= T * TOP_K.
+void reduce_scatter_unweighted_fused(
+    torch::Tensor const& gemm2_out,
+    torch::Tensor const& sorted_tids,
+    torch::Tensor&       out,
+    torch::Tensor&       token_counts,
+    torch::Tensor&       token_perm,
+    int T,
+    int TOP_K)
+{
+  TORCH_CHECK(gemm2_out.is_cuda() && gemm2_out.dim() == 2);
+  TORCH_CHECK(gemm2_out.scalar_type() == torch::kBFloat16);
+  int M = gemm2_out.size(0);
+  int N2 = gemm2_out.size(1);
+  TORCH_CHECK(N2 % 8 == 0, "N2 must be multiple of 8 for vectorized IO");
+  TORCH_CHECK(out.size(0) == T && out.size(1) == N2);
+  TORCH_CHECK(token_counts.numel() >= T);
+  TORCH_CHECK(token_perm.numel() >= T * TOP_K);
+
+  auto stream = at::cuda::getCurrentCUDAStream(gemm2_out.get_device()).stream();
+  cudaMemsetAsync(token_counts.data_ptr(), 0, T * sizeof(int), stream);
+
+  int threads = 256;
+  int blocks = (M + threads - 1) / threads;
+  fused_inverse_bucket_kernel_2d<<<blocks, threads, 0, stream>>>(
+      sorted_tids.data_ptr<int>(), M, T, TOP_K,
+      token_counts.data_ptr<int>(),
+      token_perm.data_ptr<int>());
+
+  reduce_scatter_from_2d_perm_kernel<<<T, 128, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(gemm2_out.data_ptr()),
+      token_counts.data_ptr<int>(),
+      token_perm.data_ptr<int>(),
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+      T, N2, TOP_K);
 }
 
 void reduce_scatter_unweighted_prebucketed(
@@ -2739,6 +4097,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("reduce_scatter_prebucketed", &reduce_scatter_prebucketed);
   m.def("reduce_scatter_unweighted_prebucketed", &reduce_scatter_unweighted_prebucketed);
   m.def("reduce_scatter_unweighted", &reduce_scatter_unweighted);
+  m.def("reduce_scatter_unweighted_fused", &reduce_scatter_unweighted_fused);
   m.def("token_bucket_scan_and_place", &token_bucket_scan_and_place);
   m.def("fused_route_topk", &fused_route_topk);
   m.def("fused_gather_hidden_scales", &fused_gather_hidden_scales);
@@ -2746,10 +4105,24 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fused_dispatch", &fused_dispatch);
   m.def("fused_dispatch_gather_hidden_scales", &fused_dispatch_gather_hidden_scales);
   m.def("mxf8_transcode_activations", &mxf8_transcode_activations);
+  m.def("mxf8_transcode_and_pack_sfa", &mxf8_transcode_and_pack_sfa);
   m.def("mxf8_transcode_weights_impl", &mxf8_transcode_weights_impl);
+  m.def("mxf8_pack_weight_sfb_impl", &mxf8_pack_weight_sfb_impl);
+  m.def("moe_mxf8_setup_ptrs", &moe_mxf8_setup_ptrs);
+  m.def("moe_mxf8_grouped_mm_prepacked", &moe_mxf8_grouped_mm_prepacked);
+  m.def("moe_mxf8_grouped_mm_prepacked_1sm", &moe_mxf8_grouped_mm_prepacked_1sm);
+  m.def("moe_mxf8_grouped_mm_prepacked_256_256", &moe_mxf8_grouped_mm_prepacked_256_256);
+  m.def("moe_mxf8_grouped_mm_prepacked_128_256_1sm", &moe_mxf8_grouped_mm_prepacked_128_256_1sm);
+  m.def("moe_mxf8_grouped_mm_prepacked_fp8out", &moe_mxf8_grouped_mm_prepacked_fp8out);
+  m.def("get_mxf8_fp8out_sizes_stride", &get_mxf8_fp8out_sizes_stride);
+  m.def("get_mxf8_fp8out_sizes_layout_sfd", &get_mxf8_fp8out_sizes_layout_sfd);
+  m.def("compute_mxf8_sfd_offsets_device", &compute_mxf8_sfd_offsets_device);
+  m.def("fused_gather_mxf8", &fused_gather_mxf8);
+  m.def("swiglu_fp8_requant_weighted_mxf8", &swiglu_fp8_requant_weighted_mxf8);
   m.def("moe_mxf8_grouped_mm", &moe_mxf8_grouped_mm);
   m.def("compute_mxf8_sfa_layout_offsets_host", &compute_mxf8_sfa_layout_offsets_host);
   m.def("compute_mxf8_sfb_layout_offsets_host", &compute_mxf8_sfb_layout_offsets_host);
+  m.def("compute_mxf8_sf_offsets_device", &compute_mxf8_sf_offsets_device);
   m.def("get_mxf8_sizes_stride", &get_mxf8_sizes_stride);
   m.def("get_mxf8_sizes_layout_sfa", &get_mxf8_sizes_layout_sfa);
   m.def("get_mxf8_sizes_layout_sfb", &get_mxf8_sizes_layout_sfb);
@@ -3254,6 +4627,14 @@ def _get_workspace(device, ne, T, N1, K1, N2, K2):
     if key not in _workspace_cache:
         ext = _get_ext()
         stride_sz, sfa_sz, sfb_sz = ext.get_sizes()
+        # Only allocate MxF8 workspace buffers for workloads that will take
+        # the MxF8 path (matches the use_mxf8 gate in _run_pipeline_dynamic).
+        _mxf8_enabled  = bool(int(os.environ.get("USE_MXF8", "1")))
+        _mxf8_min_t    = int(os.environ.get("MXF8_MIN_T", "4096"))
+        use_mxf8 = _mxf8_enabled and T >= _mxf8_min_t
+        mxf8_stride_sz = int(ext.get_mxf8_sizes_stride()) if use_mxf8 else 1
+        mxf8_sfa_sz    = int(ext.get_mxf8_sizes_layout_sfa()) if use_mxf8 else 1
+        mxf8_sfb_sz    = int(ext.get_mxf8_sizes_layout_sfb()) if use_mxf8 else 1
         bufs = dict(
             stride_sz=stride_sz,
             sfa_sz=sfa_sz,
@@ -3304,8 +4685,105 @@ def _get_workspace(device, ne, T, N1, K1, N2, K2):
         bufs["problem_sizes_1"][:, 2] = K1
         bufs["problem_sizes_2"][:, 1] = N2
         bufs["problem_sizes_2"][:, 2] = K2
+
+        # v18 MxF8 workspace (only allocated when USE_MXF8=1 to save memory).
+        if use_mxf8:
+            H = N1 // 2
+            bufs["mxf8_gemm1_a_ptrs"] = torch.empty(ne, device=device, dtype=torch.int64)
+            bufs["mxf8_gemm1_b_ptrs"] = torch.empty(ne, device=device, dtype=torch.int64)
+            bufs["mxf8_gemm1_out_ptrs"] = torch.empty(ne, device=device, dtype=torch.int64)
+            bufs["mxf8_gemm1_sfa_ptrs"] = torch.empty(ne, device=device, dtype=torch.int64)
+            bufs["mxf8_gemm1_sfb_ptrs"] = torch.empty(ne, device=device, dtype=torch.int64)
+            bufs["mxf8_gemm2_a_ptrs"] = torch.empty(ne, device=device, dtype=torch.int64)
+            bufs["mxf8_gemm2_b_ptrs"] = torch.empty(ne, device=device, dtype=torch.int64)
+            bufs["mxf8_gemm2_out_ptrs"] = torch.empty(ne, device=device, dtype=torch.int64)
+            bufs["mxf8_gemm2_sfa_ptrs"] = torch.empty(ne, device=device, dtype=torch.int64)
+            bufs["mxf8_gemm2_sfb_ptrs"] = torch.empty(ne, device=device, dtype=torch.int64)
+            bufs["mxf8_stride_a"] = torch.empty(ne * mxf8_stride_sz, device=device, dtype=torch.uint8)
+            bufs["mxf8_stride_b"] = torch.empty(ne * mxf8_stride_sz, device=device, dtype=torch.uint8)
+            bufs["mxf8_stride_c"] = torch.empty(ne * mxf8_stride_sz, device=device, dtype=torch.uint8)
+            bufs["mxf8_layout_sfa_1"] = torch.empty(ne * mxf8_sfa_sz, device=device, dtype=torch.uint8)
+            bufs["mxf8_layout_sfb_1"] = torch.empty(ne * mxf8_sfb_sz, device=device, dtype=torch.uint8)
+            bufs["mxf8_layout_sfa_2"] = torch.empty(ne * mxf8_sfa_sz, device=device, dtype=torch.uint8)
+            bufs["mxf8_layout_sfb_2"] = torch.empty(ne * mxf8_sfb_sz, device=device, dtype=torch.uint8)
+            bufs["mxf8_expert_offsets"] = torch.empty(ne + 1, device=device, dtype=torch.int32)
+            # UE8M0 scale buffers for activations (per-call) and weights (one-time, cached below).
+            bufs["mxf8_act_scales_ue8m0"] = torch.empty(
+                total_tokens, K1 // 128, device=device, dtype=torch.float32)
+            bufs["mxf8_gemm2_act_scales_ue8m0"] = torch.empty(
+                total_tokens, K2 // 128, device=device, dtype=torch.float32)
+            # Transcoded weight payloads (in place overwrite of a copy at init).
+            bufs["mxf8_gemm1_w_tr"] = None  # filled at first call when weights seen
+            bufs["mxf8_gemm1_w_sc_ue8m0"] = None
+            bufs["mxf8_gemm2_w_tr"] = None
+            bufs["mxf8_gemm2_w_sc_ue8m0"] = None
+            bufs["mxf8_weights_ready"] = False
+            # SFA/SFB packed UE8M0 buffers.
+            # For SFA (activations): sum across experts is bounded by
+            # total_tokens + ne*127 padding (each expert pads up to 128).
+            # For SFB (weights): always ne * (per-expert size) since each expert
+            # has fixed N.
+            _K32_g1 = ((K1 + 31) // 32) * 4
+            _K32_g2 = ((K2 + 31) // 32) * 4
+            max_sfa_total_1 = (((total_tokens + ne * 128 + 127) // 128) * 128) * _K32_g1
+            max_sfb_total_1 = ne * (((N1 + 127) // 128) * 128) * _K32_g1
+            max_sfa_total_2 = (((total_tokens + ne * 128 + 127) // 128) * 128) * _K32_g2
+            max_sfb_total_2 = ne * (((N2 + 127) // 128) * 128) * _K32_g2
+            bufs["mxf8_sfa_buffer_1"] = torch.empty(max_sfa_total_1, device=device, dtype=torch.uint8)
+            bufs["mxf8_sfb_buffer_1"] = torch.empty(max_sfb_total_1, device=device, dtype=torch.uint8)
+            bufs["mxf8_sfa_buffer_2"] = torch.empty(max_sfa_total_2, device=device, dtype=torch.uint8)
+            bufs["mxf8_sfb_buffer_2"] = torch.empty(max_sfb_total_2, device=device, dtype=torch.uint8)
+            bufs["mxf8_sfa_byte_offsets_1"] = torch.empty(ne + 1, device=device, dtype=torch.int32)
+            bufs["mxf8_sfb_byte_offsets_1"] = torch.empty(ne + 1, device=device, dtype=torch.int32)
+            bufs["mxf8_sfa_byte_offsets_2"] = torch.empty(ne + 1, device=device, dtype=torch.int32)
+            bufs["mxf8_sfb_byte_offsets_2"] = torch.empty(ne + 1, device=device, dtype=torch.int32)
         _workspace_cache[key] = bufs
     return _workspace_cache[key]
+
+
+def _mxf8_ensure_weights_transcoded(bufs, gemm1_weights, gemm1_weights_scale,
+                                    gemm2_weights, gemm2_weights_scale):
+    """Transcode weights + pre-pack SFB layout once per workload."""
+    if bufs["mxf8_weights_ready"]:
+        return
+    ext = _get_ext()
+    bufs["mxf8_gemm1_w_tr"]       = gemm1_weights.clone()
+    bufs["mxf8_gemm1_w_sc_ue8m0"] = torch.empty_like(gemm1_weights_scale)
+    bufs["mxf8_gemm2_w_tr"]       = gemm2_weights.clone()
+    bufs["mxf8_gemm2_w_sc_ue8m0"] = torch.empty_like(gemm2_weights_scale)
+    ext.mxf8_transcode_weights_impl(
+        bufs["mxf8_gemm1_w_tr"], gemm1_weights_scale, bufs["mxf8_gemm1_w_sc_ue8m0"])
+    ext.mxf8_transcode_weights_impl(
+        bufs["mxf8_gemm2_w_tr"], gemm2_weights_scale, bufs["mxf8_gemm2_w_sc_ue8m0"])
+
+    # Pre-pack SFB into CUTLASS tiled layout (once, static per workload).
+    N1 = int(gemm1_weights.shape[1]); K1 = int(gemm1_weights.shape[2])
+    N2 = int(gemm2_weights.shape[1]); K2 = int(gemm2_weights.shape[2])
+    ext.mxf8_pack_weight_sfb_impl(
+        bufs["mxf8_gemm1_w_sc_ue8m0"],
+        bufs["mxf8_layout_sfb_1"],
+        bufs["mxf8_sfb_byte_offsets_1"],
+        bufs["mxf8_sfb_buffer_1"],
+        N1, K1)
+    ext.mxf8_pack_weight_sfb_impl(
+        bufs["mxf8_gemm2_w_sc_ue8m0"],
+        bufs["mxf8_layout_sfb_2"],
+        bufs["mxf8_sfb_byte_offsets_2"],
+        bufs["mxf8_sfb_buffer_2"],
+        N2, K2)
+    bufs["mxf8_weights_ready"] = True
+
+
+def _mxf8_compute_sf_offsets(ext, problem_sizes, bufs, gemm_idx):
+    """Compute SFA/SFB byte offsets for given problem_sizes and fill buffers."""
+    sfa_offsets, sfa_total = ext.compute_mxf8_sfa_layout_offsets_host(problem_sizes)
+    sfb_offsets, sfb_total = ext.compute_mxf8_sfb_layout_offsets_host(problem_sizes)
+    sfa_key = f"mxf8_sfa_byte_offsets_{gemm_idx}"
+    sfb_key = f"mxf8_sfb_byte_offsets_{gemm_idx}"
+    device = bufs[sfa_key].device
+    bufs[sfa_key].copy_(torch.tensor(sfa_offsets, device=device, dtype=torch.int32))
+    bufs[sfb_key].copy_(torch.tensor(sfb_offsets, device=device, dtype=torch.int32))
+    return sfa_total, sfb_total
 
 
 def _run_pipeline_graph_safe(
@@ -3444,7 +4922,56 @@ def _run_pipeline_dynamic(
     # Use pre-allocated workspace buffers, narrowed to total_valid rows.
     packed_acts = bufs["packed_acts"][:total_valid]
     packed_act_scales = bufs["packed_act_scales"][:total_valid]
-    if not use_fused_dispatch_gather:
+
+    # MxF8 path: hardware block-scaled MMA via tcgen05.mma.kind.mxf8f6f4.
+    # Requires transcoded activations + weights (sign flip + residual
+    # absorbed into payload). Contest scales are signed fp32 but Central
+    # Limit Theorem over K=7168 amortizes the re-quantization error; T=1 and
+    # very small T regress (no averaging).
+    # Default ON for large T since the fused pipeline (gather→MxF8 GEMM1,
+    # swiglu→MxF8 GEMM2) hits hardware peak throughput. Set USE_MXF8=0 to
+    # disable.
+    use_mxf8 = bool(int(os.environ.get("USE_MXF8", "1"))) and T >= int(
+        os.environ.get("MXF8_MIN_T", "4096"))
+    if os.environ.get("MXF8_TRACE") and use_mxf8:
+        print(f"[MXF8] T={T} use_mxf8=True bucket={bucket_launches is not None}", flush=True)
+    if use_mxf8:
+        _mxf8_ensure_weights_transcoded(
+            bufs, gemm1_weights, gemm1_weights_scale,
+            gemm2_weights, gemm2_weights_scale,
+        )
+        mxf8_act_scales_ue8m0 = bufs["mxf8_act_scales_ue8m0"][:total_valid]
+        # Pre-run setup and compute SFA offsets so gather+transcode+pack can
+        # write directly into the tiled SFA layout.
+        ext.compute_mxf8_sf_offsets_device(
+            bufs["problem_sizes_1"],
+            bufs["mxf8_sfa_byte_offsets_1"],
+            bufs["mxf8_sfb_byte_offsets_1"])
+        ext.moe_mxf8_setup_ptrs(
+            bufs["gemm1_out"], packed_acts, bufs["mxf8_gemm1_w_tr"],
+            bufs["offsets_buf"], bufs["problem_sizes_1"],
+            bufs["mxf8_gemm1_a_ptrs"], bufs["mxf8_gemm1_b_ptrs"],
+            bufs["mxf8_gemm1_out_ptrs"],
+            bufs["mxf8_gemm1_sfa_ptrs"], bufs["mxf8_gemm1_sfb_ptrs"],
+            bufs["mxf8_stride_a"], bufs["mxf8_stride_b"], bufs["mxf8_stride_c"],
+            bufs["mxf8_layout_sfa_1"], bufs["mxf8_layout_sfb_1"],
+            bufs["mxf8_sfa_buffer_1"], bufs["mxf8_sfb_buffer_1"],
+            bufs["mxf8_sfa_byte_offsets_1"], bufs["mxf8_sfb_byte_offsets_1"])
+        if use_fused_dispatch_gather:
+            # packed_acts/packed_act_scales already populated by fused-dispatch
+            # upstream; run transcode+pack separately.
+            ext.mxf8_transcode_and_pack_sfa(
+                packed_acts, packed_act_scales, mxf8_act_scales_ue8m0,
+                bufs["offsets_buf"], bufs["mxf8_sfa_byte_offsets_1"],
+                bufs["mxf8_layout_sfa_1"], bufs["mxf8_sfa_buffer_1"])
+        else:
+            # Fused gather+transcode+SFA pack in one kernel.
+            ext.fused_gather_mxf8(
+                hidden_states, hs_scale, sorted_tids,
+                packed_acts, mxf8_act_scales_ue8m0,
+                bufs["offsets_buf"], bufs["mxf8_sfa_byte_offsets_1"],
+                bufs["mxf8_layout_sfa_1"], bufs["mxf8_sfa_buffer_1"])
+    elif not use_fused_dispatch_gather:
         ext.fused_gather_hidden_scales(
             hidden_states, hs_scale, sorted_tids,
             packed_acts, packed_act_scales)
@@ -3501,6 +5028,18 @@ def _run_pipeline_dynamic(
                     bufs["layout_sfa"], bufs["layout_sfb"],
                     bufs["workspace"],
                 )
+        elif use_mxf8:
+            # All setup done above (ptrs, SFA pack fused with transcode, SFB pre-packed).
+            ext.moe_mxf8_grouped_mm_prepacked(
+                gemm1_out,
+                packed_acts, bufs["mxf8_gemm1_w_tr"],
+                bufs["problem_sizes_1"],
+                bufs["mxf8_gemm1_a_ptrs"], bufs["mxf8_gemm1_b_ptrs"], bufs["mxf8_gemm1_out_ptrs"],
+                bufs["mxf8_gemm1_sfa_ptrs"], bufs["mxf8_gemm1_sfb_ptrs"],
+                bufs["mxf8_stride_a"], bufs["mxf8_stride_b"], bufs["mxf8_stride_c"],
+                bufs["mxf8_layout_sfa_1"], bufs["mxf8_layout_sfb_1"],
+                bufs["workspace"],
+            )
         else:
             ext.moe_blockwise_grouped_mm_v2(
                 gemm1_out,
@@ -3520,7 +5059,29 @@ def _run_pipeline_dynamic(
         act_scale_for_gemm2 = bufs["act_scale_for_gemm2"][:total_valid]
         # v17: fold routing weight into A scale of GEMM2 -> unweighted reduce_scatter.
         use_weighted_fold = bool(int(os.environ.get("V17_WEIGHTED_FOLD", "1")))
-        if use_weighted_fold:
+        if use_mxf8 and use_weighted_fold:
+            # Fused: swiglu + fp8 requant + MxF8 transcode + SFA pack in ONE kernel.
+            mxf8_gemm2_act_scales_ue8m0 = bufs["mxf8_gemm2_act_scales_ue8m0"][:total_valid]
+            ext.compute_mxf8_sf_offsets_device(
+                bufs["problem_sizes_2"],
+                bufs["mxf8_sfa_byte_offsets_2"],
+                bufs["mxf8_sfb_byte_offsets_2"])
+            ext.moe_mxf8_setup_ptrs(
+                bufs["gemm2_out"], act_q, bufs["mxf8_gemm2_w_tr"],
+                bufs["offsets_buf"], bufs["problem_sizes_2"],
+                bufs["mxf8_gemm2_a_ptrs"], bufs["mxf8_gemm2_b_ptrs"],
+                bufs["mxf8_gemm2_out_ptrs"],
+                bufs["mxf8_gemm2_sfa_ptrs"], bufs["mxf8_gemm2_sfb_ptrs"],
+                bufs["mxf8_stride_a"], bufs["mxf8_stride_b"], bufs["mxf8_stride_c"],
+                bufs["mxf8_layout_sfa_2"], bufs["mxf8_layout_sfb_2"],
+                bufs["mxf8_sfa_buffer_2"], bufs["mxf8_sfb_buffer_2"],
+                bufs["mxf8_sfa_byte_offsets_2"], bufs["mxf8_sfb_byte_offsets_2"])
+            ext.swiglu_fp8_requant_weighted_mxf8(
+                gemm1_out, sorted_weights, act_q, row_scales,
+                mxf8_gemm2_act_scales_ue8m0,
+                bufs["offsets_buf"], bufs["mxf8_sfa_byte_offsets_2"],
+                bufs["mxf8_layout_sfa_2"], bufs["mxf8_sfa_buffer_2"])
+        elif use_weighted_fold:
             ext.swiglu_fp8_requant_weighted(
                 gemm1_out, sorted_weights, act_q, row_scales, act_scale_for_gemm2)
         else:
@@ -3554,6 +5115,17 @@ def _run_pipeline_dynamic(
                     bufs["layout_sfa"], bufs["layout_sfb"],
                     bufs["workspace"],
                 )
+        elif use_mxf8:
+            ext.moe_mxf8_grouped_mm_prepacked(
+                gemm2_out,
+                act_q, bufs["mxf8_gemm2_w_tr"],
+                bufs["problem_sizes_2"],
+                bufs["mxf8_gemm2_a_ptrs"], bufs["mxf8_gemm2_b_ptrs"], bufs["mxf8_gemm2_out_ptrs"],
+                bufs["mxf8_gemm2_sfa_ptrs"], bufs["mxf8_gemm2_sfb_ptrs"],
+                bufs["mxf8_stride_a"], bufs["mxf8_stride_b"], bufs["mxf8_stride_c"],
+                bufs["mxf8_layout_sfa_2"], bufs["mxf8_layout_sfb_2"],
+                bufs["workspace"],
+            )
         else:
             ext.moe_blockwise_grouped_mm_v2(
                 gemm2_out,
@@ -3604,10 +5176,20 @@ def _run_pipeline_dynamic(
             )
     else:
         if use_weighted_fold:
-            ext.reduce_scatter_unweighted(
-                gemm2_out, sorted_tids, bufs["out_bf16"],
-                bufs["token_counts_buf"], bufs["token_offsets_buf"], bufs["token_perm_buf"],
-                T)
+            # Fused 2-kernel reduce-scatter (inverse-bucket + reduce). Replaces
+            # the prior 4-kernel chain (count/scan/place/reduce). Saves ~25 μs
+            # of launch+memset overhead per call. Set USE_FUSED_REDUCE=0 to
+            # revert to the 4-kernel path.
+            if bool(int(os.environ.get("USE_FUSED_REDUCE", "1"))):
+                ext.reduce_scatter_unweighted_fused(
+                    gemm2_out, sorted_tids, bufs["out_bf16"],
+                    bufs["token_counts_buf"], bufs["token_perm_buf"],
+                    T, TOP_K)
+            else:
+                ext.reduce_scatter_unweighted(
+                    gemm2_out, sorted_tids, bufs["out_bf16"],
+                    bufs["token_counts_buf"], bufs["token_offsets_buf"], bufs["token_perm_buf"],
+                    T)
         else:
             ext.reduce_scatter(
                 gemm2_out, sorted_weights, sorted_tids, bufs["out_bf16"],

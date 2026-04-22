@@ -149,3 +149,75 @@ The contest score is constrained by the software-scaled FP32-blockwise mainloop 
 The realistic ceiling is ~55–65% of raw roofline, and we are already close to it.
 
 To get the remaining ~10% on Branch A would require custom CUTLASS EVTs (1–2 weeks of CUTLASS C++ work). Beyond that, customs CuTe persistent kernels.
+
+## Update: Branch B (MxF8 HW path) partially reopened
+
+After the V3 sign-separated transcode probe passed 18/19 workloads at 90%+ match,
+the MxF8 hardware path was plumbed end-to-end. Measured pure-GEMM timing:
+
+- Blockwise GEMM1: 575 μs (1.6 PFLOPS, 36% of peak)
+- **MxF8 GEMM1: 472 μs (2.0 PFLOPS, 44% of peak)** — 18% faster.
+
+Full pipeline bench (T=14107):
+
+- Baseline: 1.233 ms
+- MxF8: 1.229 ms → **1.003x — essentially parity.**
+
+Correctness on T=11948, T=14107: 93.3%, 91.3% match (pass contest 90% bar).
+
+### Why parity despite faster GEMM?
+
+MxF8 overhead per GEMM:
+
+- transcode_activations + SFA pack (fused): 67 μs
+- compute_SF_offsets: 3 μs
+- setup_ptrs: 2 μs
+- **Total: ~72 μs per GEMM × 2 = 145 μs overhead**
+
+GEMM savings:
+
+- GEMM1: 143 μs
+- GEMM2: ~50 μs
+- **Total: ~190 μs savings**
+
+Net: 45 μs theoretical gain, 4 μs measured. Within stream serialization + CUDA
+graph capture noise.
+
+### Full fusion integration (final)
+
+After fusing transcode+pack into upstream kernels:
+
+- `fused_gather_mxf8_kernel` = gather + transcode + SFA-pack for GEMM1 (single pass)
+- `swiglu_fp8_requant_weighted_mxf8_kernel` = swiglu + requant + transcode + SFA-pack for GEMM2
+- `mxf8_pack_weight_sfb_impl` = one-time weight SFB pack at workload init
+- `moe_mxf8_grouped_mm_prepacked` = pure CUTLASS launch (no setup/pack overhead)
+- PDL (Programmatic Dependent Launch, SM100A) enabled via `gemm_op.run(stream, nullptr, true)`
+
+### Final measured speedup (T=14107, 3 runs average)
+
+- Baseline (v17 fp32-blockwise): 1.263 ms
+- MxF8 (v18, default): 1.195 ms
+- **Speedup: 1.05-1.06x consistent** (5-6% faster)
+- Match ratio: 91.7% (passes 90% bar)
+
+### Default config
+
+MxF8 is ENABLED by default (`USE_MXF8=1`) for T≥4096 (`MXF8_MIN_T=4096`).
+Below that, the FP32-blockwise path runs unchanged. Can be disabled via
+`USE_MXF8=0` env var.
+
+### Why only 5-6% instead of 25-30%
+
+- CUTLASS MxF8 GEMM kernel alone is 18% faster than blockwise (472 μs vs 575 μs).
+- But the transcode step adds ~67 μs per GEMM (HBM BW-bound at 2.3x theoretical min).
+- Net: ~100 μs savings per pipeline call → ~5% of 1.2 ms.
+- Higher speedup would require fusing transcode into GEMM epilogue of the
+  PREVIOUS stage (e.g., into reduce-scatter input of a prior layer), which
+  crosses layer boundaries and is out of scope for this single-layer kernel.
+
+### What we kept from Branch A
+
+- v17 weighted-fold (folding routing weight into GEMM2 A-scale) is still on.
+- v18 wide vectorized reduce-scatter still on.
+- Bucket/segment modes still available via env vars.
+- All prior correctness tests still pass.
