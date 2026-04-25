@@ -1,5 +1,5 @@
 [solution]
-name = "cutlass_sm100_v19_mxf8_256x256_tile_fused_reduce"
+name = "cutlass_sm100_v20c_singleblock_dispatch_warpreduce_parallel_sfa"
 definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
 author = "KernelEvolve"
 
