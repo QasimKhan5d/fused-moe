@@ -5,6 +5,18 @@ EVALUATION.md
 FAQ.md
 tmp/
 
+# Local writeup / review artifacts (not part of organizer submission)
+WRITEUP*.md
+WRITEUP*.pdf
+MLSys2026_*.pdf
+pdf.css
+scripts/render_writeup_pdf.py
+scripts/export_writeup_docx.py
+
+# Local handoff / scratch notes
+HANDOFF*.md
+config_python.toml
+
 # CUDA build artifacts
 *.o
 *.obj
