@@ -1,33 +1,15 @@
-"""
-Fused MoE kernel — CUTLASS SM100 FP8 blockwise-scaled grouped GEMMs.
+"""DeepSeek-V3 fused MoE kernel for the FlashInfer contest.
 
-Architecture (based on SGLang/DeepGEMM reference):
-  - K-major SFA/SFB layout → no per-expert scale packing needed
-  - Device-side `get_group_gemm_starts` kernel builds per-expert ptr/layout arrays
-  - AB-swap path for small-M (MmaConfig1: <256,32,128> cluster<2,1,1>)
-  - Standard path for large-M (MmaConfig2: <128,128,128> cluster<1,1,1>)
-  - Pre-allocated workspace cached per (T, device) key
-
-Pipeline:
-  1. Route (PyTorch)
-  2. Dispatch (argsort + bincount)
-  3. Gather hidden+scales by sorted token order (no padding)
-  4. GEMM1 via CUTLASS blockwise grouped
-  5. SwiGLU + FP8 per-token requant
-  6. GEMM2 via CUTLASS blockwise grouped
-  7. Weighted scatter back to [T, N2]
-
-FlashInfer entry: kernel.py::kernel
+The implementation uses a Python entry point that JIT-compiles CUDA/CUTLASS
+helpers and runs a fused routing, dispatch, grouped-GEMM, SwiGLU, and
+reduce-scatter pipeline. Small and medium workloads use a CUDA-graph-safe
+fixed-shape path; large workloads use a compact dynamic path with an SM100 MxF8
+hardware block-scaled GEMM sub-path.
 """
 import glob
 import os
-import sys
 import tempfile
 import torch
-import os as _os_cfg_X
-import os as _os_cfg_J
-import os as _os_cfg_V
-import os as _os_cfg_K
 
 E_GLOBAL = 256
 N_GROUP = 8
@@ -1480,7 +1462,7 @@ void swiglu_fp8_requant_weighted_mxf8(
 }
 
 // ============================================================================
-// FP8-IN SwiGLU (Phase A fusion step): consumes FP8 [M, 2H] + per-32-col UE8M0
+// FP8-IN SwiGLU helper: consumes FP8 [M, 2H] + per-32-col UE8M0
 // scales produced by MxF8GemmBuilderFP8Out (2SM variant), computes SwiGLU,
 // writes FP8 act_q + per-row UE8M0 scale for GEMM2.
 //
@@ -2219,7 +2201,7 @@ void moe_mxf8_grouped_mm_prepacked(
 {
   // Number of grouped-GEMM problems: derived from a_ptrs length so this
   // launcher works both for the per-expert case (a_ptrs[E]) and the
-  // per-tile case (a_ptrs[tile_count], Phase A substrate).
+  // per-tile case (a_ptrs[tile_count]).
   int E = static_cast<int>(a_ptrs.size(0));
   using LayoutOut = cutlass::layout::RowMajor;
   auto stream = at::cuda::getCurrentCUDAStream(a.get_device()).stream();
@@ -3626,191 +3608,6 @@ void weighted_scatter(
       token_ids.data_ptr<int>(),
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
       M, N2, T);
-}
-
-// ============================================================================
-// Phase A scaffolding: flat tile-list builder.
-//
-// Given per-expert offsets (prefix sum of per-expert local token counts),
-// emit a flat list of (expert_id, m_start) tuples covering every BLOCK_M-sized
-// output-M tile that has work. This replaces the implicit per-expert grouped
-// traversal baked into CUTLASS's PersistentTileSchedulerSm100Group with
-// an explicit list we control — needed for our own persistent kernel.
-//
-// Single-block kernel: num_experts is <= 32 here, one warp does everything.
-// Output arrays are sized for a worst-case `num_experts + num_assignments /
-// block_m` entries (one extra per-expert partial tile).
-// ============================================================================
-__global__ void moe_flat_tile_list_kernel(
-    int32_t const* __restrict__ offsets,    // [E+1] prefix sums
-    int32_t*       __restrict__ tile_expert,
-    int32_t*       __restrict__ tile_mstart,
-    int32_t*       __restrict__ tile_count,
-    int num_experts,
-    int block_m,
-    int max_tiles)
-{
-  if (blockIdx.x != 0) return;
-  const int tid = threadIdx.x;
-
-  // Each thread owns one expert.  Compute its tile count.
-  int my_off_start = 0;
-  int my_num_tiles = 0;
-  if (tid < num_experts) {
-    int off_start = offsets[tid];
-    int off_end   = offsets[tid + 1];
-    int count     = off_end - off_start;
-    my_off_start  = off_start;
-    my_num_tiles  = count > 0 ? (count + block_m - 1) / block_m : 0;
-  }
-
-  __shared__ int s_excl[64];
-  if (tid < num_experts) s_excl[tid] = my_num_tiles;
-  __syncthreads();
-
-  if (tid == 0) {
-    int acc = 0;
-    for (int e = 0; e < num_experts; ++e) {
-      int v = s_excl[e];
-      s_excl[e] = acc;
-      acc += v;
-    }
-    tile_count[0] = acc;
-  }
-  __syncthreads();
-
-  if (tid < num_experts && my_num_tiles > 0) {
-    int base = s_excl[tid];
-    for (int mt = 0; mt < my_num_tiles; ++mt) {
-      int idx = base + mt;
-      if (idx < max_tiles) {
-        tile_expert[idx] = tid;
-        tile_mstart[idx] = my_off_start + mt * block_m;
-      }
-    }
-  }
-}
-
-void moe_flat_tile_list(
-    torch::Tensor const& offsets,         // [E+1] int32
-    torch::Tensor&       tile_expert,     // [max_tiles] int32
-    torch::Tensor&       tile_mstart,     // [max_tiles] int32
-    torch::Tensor&       tile_count,      // [1] int32
-    int block_m)
-{
-  TORCH_CHECK(offsets.is_cuda() && offsets.scalar_type() == torch::kInt32);
-  TORCH_CHECK(tile_expert.is_cuda() && tile_expert.scalar_type() == torch::kInt32);
-  TORCH_CHECK(tile_mstart.is_cuda() && tile_mstart.scalar_type() == torch::kInt32);
-  TORCH_CHECK(tile_count.is_cuda() && tile_count.scalar_type() == torch::kInt32);
-  int num_experts = offsets.size(0) - 1;
-  int max_tiles = tile_expert.size(0);
-  TORCH_CHECK(tile_mstart.size(0) == max_tiles);
-  auto stream = at::cuda::getCurrentCUDAStream(offsets.get_device()).stream();
-  moe_flat_tile_list_kernel<<<1, 64, 0, stream>>>(
-      offsets.data_ptr<int32_t>(),
-      tile_expert.data_ptr<int32_t>(),
-      tile_mstart.data_ptr<int32_t>(),
-      tile_count.data_ptr<int32_t>(),
-      num_experts, block_m, max_tiles);
-}
-
-// ============================================================================
-// MegaMoE (M, N)-tile scheduler: emits (expert, m_start, n_tile) TRIPLES.
-//
-// Each grid block in the megamoe kernel owns ONE (expert, m_tile, n_tile)
-// triple — it does NOT sweep N-tiles internally. The kernel's grid is
-// n_tiles_per_expert × (existing M-tile count). For T=14107 with tile_M=128
-// that's ~928 × 32 ≈ 30k grid blocks. This matches the CUTLASS SM100
-// persistent scheduler's unit of work.
-// ============================================================================
-__global__ void moe_flat_tile_list_mn_kernel(
-    int32_t const* __restrict__ offsets,    // [E+1] prefix sums
-    int32_t*       __restrict__ tile_expert,
-    int32_t*       __restrict__ tile_mstart,
-    int32_t*       __restrict__ tile_ntile,
-    int32_t*       __restrict__ tile_count,
-    int num_experts,
-    int block_m,
-    int n_tiles_per_expert,
-    int max_tiles)
-{
-  if (blockIdx.x != 0) return;
-  const int tid = threadIdx.x;
-
-  // Each thread owns one expert; compute its M-tile count.
-  int my_off_start = 0;
-  int my_num_m_tiles = 0;
-  if (tid < num_experts) {
-    int off_start = offsets[tid];
-    int off_end   = offsets[tid + 1];
-    int count     = off_end - off_start;
-    my_off_start  = off_start;
-    my_num_m_tiles = count > 0 ? (count + block_m - 1) / block_m : 0;
-  }
-
-  // Per-expert (M, N) tile count = M_tiles * n_tiles_per_expert.
-  int my_num_mn_tiles = my_num_m_tiles * n_tiles_per_expert;
-
-  __shared__ int s_excl[64];
-  if (tid < num_experts) s_excl[tid] = my_num_mn_tiles;
-  __syncthreads();
-
-  if (tid == 0) {
-    int acc = 0;
-    for (int e = 0; e < num_experts; ++e) {
-      int v = s_excl[e];
-      s_excl[e] = acc;
-      acc += v;
-    }
-    tile_count[0] = acc;
-  }
-  __syncthreads();
-
-  if (tid < num_experts && my_num_m_tiles > 0) {
-    int base = s_excl[tid];
-    // Interleave (m_tile, n_tile): the outer loop is m_tile, inner is n_tile.
-    // This keeps tiles of the same expert contiguous in the grid, which is
-    // good for tensormap-reuse across adjacent blocks.
-    for (int mt = 0; mt < my_num_m_tiles; ++mt) {
-      for (int nt = 0; nt < n_tiles_per_expert; ++nt) {
-        int idx = base + mt * n_tiles_per_expert + nt;
-        if (idx < max_tiles) {
-          tile_expert[idx] = tid;
-          tile_mstart[idx] = my_off_start + mt * block_m;
-          tile_ntile[idx]  = nt;
-        }
-      }
-    }
-  }
-}
-
-void moe_flat_tile_list_mn(
-    torch::Tensor const& offsets,         // [E+1] int32
-    torch::Tensor&       tile_expert,     // [max_tiles] int32
-    torch::Tensor&       tile_mstart,     // [max_tiles] int32
-    torch::Tensor&       tile_ntile,      // [max_tiles] int32
-    torch::Tensor&       tile_count,      // [1] int32
-    int64_t block_m,
-    int64_t n_tiles_per_expert)
-{
-  TORCH_CHECK(offsets.is_cuda() && offsets.scalar_type() == torch::kInt32);
-  TORCH_CHECK(tile_expert.is_cuda() && tile_expert.scalar_type() == torch::kInt32);
-  TORCH_CHECK(tile_mstart.is_cuda() && tile_mstart.scalar_type() == torch::kInt32);
-  TORCH_CHECK(tile_ntile.is_cuda() && tile_ntile.scalar_type() == torch::kInt32);
-  TORCH_CHECK(tile_count.is_cuda() && tile_count.scalar_type() == torch::kInt32);
-  int num_experts = offsets.size(0) - 1;
-  int max_tiles = tile_expert.size(0);
-  TORCH_CHECK(tile_mstart.size(0) == max_tiles);
-  TORCH_CHECK(tile_ntile.size(0) == max_tiles);
-  auto stream = at::cuda::getCurrentCUDAStream(offsets.get_device()).stream();
-  moe_flat_tile_list_mn_kernel<<<1, 64, 0, stream>>>(
-      offsets.data_ptr<int32_t>(),
-      tile_expert.data_ptr<int32_t>(),
-      tile_mstart.data_ptr<int32_t>(),
-      tile_ntile.data_ptr<int32_t>(),
-      tile_count.data_ptr<int32_t>(),
-      num_experts, static_cast<int>(block_m),
-      static_cast<int>(n_tiles_per_expert), max_tiles);
 }
 
 // ============================================================================
@@ -5451,31 +5248,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("get_mxf8_sizes_layout_sfa", &get_mxf8_sizes_layout_sfa);
   m.def("get_mxf8_sizes_layout_sfb", &get_mxf8_sizes_layout_sfb);
   m.def("probe_mxf8_sfa_layout", &probe_mxf8_sfa_layout);
-  m.def("moe_flat_tile_list", &moe_flat_tile_list);
-  m.def("moe_flat_tile_list_mn", &moe_flat_tile_list_mn);
 }
-'''
-
-
-# ============================================================================
-# MegaMoE custom-kernel compile unit — Phase A sub-step (a) GEMM1.
-#
-# Custom CuTe SM100 MxF8 GEMM1 kernel driven by the flat-tile-list.
-# Reuses CUTLASS's CollectiveBuilder-produced CollectiveMainloop +
-# CollectiveEpilogue types (per HANDOFF_MEGAMOE_PLAN.md §8 "Reuse that
-# machinery") but replaces CUTLASS's PersistentTileSchedulerSm100Group with
-# a trivial non-persistent scheduler: grid = (max_tiles,), each CTA owns
-# ONE (expert, m_start) tile from the flat list, iterates N-tiles internally.
-#
-# The kernel accepts the same pre-populated per-expert arrays that
-# moe_mxf8_grouped_mm_prepacked consumes — a_ptrs[E], b_ptrs[E], out_ptrs[E],
-# sfa_ptrs[E], sfb_ptrs[E], strides, layout_sfa/sfb — and routes each tile
-# to its expert via tile_expert[blockIdx.x]. No changes to the SFA/SFB
-# packing path.
-# ============================================================================
-_MOE_MEGAMOE_CU = r'''
-// MegaMoE experimental kernels omitted from the minimized submission.
-
 '''
 
 
@@ -5548,19 +5321,14 @@ def _get_ext():
     _write_if_changed(cutlass_cu, _MOE_GEMM_CU)
     _write_if_changed(fused_cu,   _MOE_FUSED_CU)
 
-    # Three separate .cu files → ninja compiles them independently and only
-    # rebuilds the ones that changed. The CUTLASS-heavy file (stable) compiles
-    # once (~3 min); the fused-helpers file (iterated on) rebuilds in ~10-15s;
-    # the megamoe file (where Phase A custom CuTe kernel lands) is kept minimal
-    # so its iterations stay <30s.
+    # Separate translation units let benchmark runs reuse the stable
+    # CUTLASS-heavy object file while rebuilding only small helper changes.
     import torch.utils.cpp_extension as cpp_ext
     if cuda_home is not None:
         cpp_ext.CUDA_HOME = cuda_home
     load = cpp_ext.load
-    # verbose=True so ninja/nvcc compile progress streams to stderr. Without
-    # this, a slow compile looks indistinguishable from a hang for several
-    # minutes after `[boot] loaded 19 workloads`.
-    _verbose = bool(int(os.environ.get("MEGAMOE_VERBOSE_BUILD", "1")))
+    # Stream compiler output so long template instantiations are visible.
+    _verbose = bool(int(os.environ.get("VERBOSE_BUILD", "1")))
     extra_flags = [
         "-O3", "--std=c++17", "-arch=sm_100a",
         "--expt-relaxed-constexpr", "-DNDEBUG",
@@ -6432,42 +6200,7 @@ def _get_workspace(device, ne, T, N1, K1, N2, K2):
         bufs["problem_sizes_2"][:, 1] = N2
         bufs["problem_sizes_2"][:, 2] = K2
 
-        # -----------------------------------------------------------------
-        # MegaMoE flat-tile-list workspace — (expert, m_start, n_tile) triples.
-        #
-        # Each grid block in megamoe_gemm1 owns ONE such triple. The kernel
-        # does NOT sweep N-tiles internally (that was a 3× slowdown bug).
-        # So the list has M_tiles_total × N_tiles_per_expert entries.
-        #
-        # `ext.moe_flat_tile_list_mn(offsets, tile_expert, tile_mstart,
-        #     tile_ntile, tile_count, block_m, n_tiles_per_expert)` populates.
-        # -----------------------------------------------------------------
-        _megamoe_bm_min = 32    # min block_m supported (for worst-case sizing)
-        _megamoe_bn      = 128  # BLK_N for middle variant
-        _megamoe_n_tiles = (N1 + _megamoe_bn - 1) // _megamoe_bn
-        _megamoe_max_mtiles = (total_tokens + _megamoe_bm_min - 1) // _megamoe_bm_min + ne
-        _megamoe_max_tiles = _megamoe_max_mtiles * _megamoe_n_tiles
-        # Round up to 64 for alignment.
-        _megamoe_max_tiles = ((_megamoe_max_tiles + 63) // 64) * 64
-        bufs["megamoe_tile_expert"] = torch.empty(
-            _megamoe_max_tiles, device=device, dtype=torch.int32)
-        bufs["megamoe_tile_mstart"] = torch.empty(
-            _megamoe_max_tiles, device=device, dtype=torch.int32)
-        bufs["megamoe_tile_ntile"] = torch.empty(
-            _megamoe_max_tiles, device=device, dtype=torch.int32)
-        bufs["megamoe_tile_count"] = torch.empty(1, device=device, dtype=torch.int32)
-        bufs["megamoe_max_tiles"] = _megamoe_max_tiles
-        bufs["megamoe_n_tiles_per_expert"] = _megamoe_n_tiles
-
-        # Fused kernel tile list: N is I (half of full N), so n_tiles_per_expert
-        # is halved compared to the middle-variant. Reuse the same buffers
-        # (fewer tiles => fits in existing capacity).
-        _I1 = N1 // 2  # 2048
-        _megamoe_fused_n_tiles = (_I1 + _megamoe_bn - 1) // _megamoe_bn  # 16
-        bufs["megamoe_fused_n_tiles_per_expert"] = _megamoe_fused_n_tiles
-        bufs["megamoe_fused_I"] = _I1
-
-        # v18 MxF8 workspace (only allocated when USE_MXF8=1 to save memory).
+        # MxF8 workspace is allocated only for workloads that use the MxF8 path.
         if use_mxf8:
             H = N1 // 2
             bufs["mxf8_gemm1_a_ptrs"] = torch.empty(ne, device=device, dtype=torch.int64)
@@ -6519,7 +6252,7 @@ def _get_workspace(device, ne, T, N1, K1, N2, K2):
             bufs["mxf8_sfa_byte_offsets_2"] = torch.empty(ne + 1, device=device, dtype=torch.int32)
             bufs["mxf8_sfb_byte_offsets_2"] = torch.empty(ne + 1, device=device, dtype=torch.int32)
 
-            # FP8-out fusion path buffers (Phase A step 1):
+            # FP8-out fusion path buffers:
             #   gemm1_out_fp8     : [total_tokens, 2H] fp8
             #   gemm1_sfd_buffer  : flat UE8M0 bytes, sized per tile-atom layout
             #   gemm1_sfd_ptrs    : [E] int64 per-expert pointers
@@ -6656,96 +6389,6 @@ def _run_pipeline_graph_safe(
         bufs["gemm2_out"], sorted_weights, sorted_tids, bufs["out_bf16"], T)
 
 
-# =============================================================================
-# MegaMoE pipeline (Phase A substrate — scaffolded, not yet custom-kernel-fused)
-# =============================================================================
-#
-# Entry point: `_run_megamoe_pipeline` — gated on `MEGAMOE_MIN_T` env flag.
-#
-# Current state (session 2026-04-23): substrate only. The new flat-tile-list
-# is populated and available via `bufs["megamoe_tile_{expert,mstart,count}"]`,
-# but the GEMM1 / SwiGLU / GEMM2 path still delegates to the existing
-# CUTLASS / helper kernels. This gives a MEGAMOE_MIN_T-gated execution path
-# that is bit-identical to the default path and therefore perf-neutral when
-# enabled.
-#
-# The next session replaces the delegating block below with a custom CuTe
-# persistent SM100 kernel driven by the flat-tile-list. Per
-# HANDOFF_MEGAMOE_PLAN.md §4 / §8:
-#   - Phase A substep (a): bf16-out GEMM1 driven by flat tile list, target
-#     latency within 5% of current on T=11948, ref_match ≥ 0.95 on all 19.
-#   - Phase A substep (b): SwiGLU in the epilogue via TMEM load →
-#     eliminates the swiglu_fp8_requant_weighted_mxf8 kernel.
-#   - Phase A substep (c): fuse GEMM2 by reading act_q from SMEM →
-#     eliminates the act_q HBM round-trip.
-#
-# The code path is kept as a drop-in for `_run_pipeline_dynamic` so the
-# upcoming custom-kernel work can iterate in isolation without touching
-# the route/dispatch/gather/scatter chain.
-# =============================================================================
-
-def _run_megamoe_pipeline(
-    routing_logits, routing_bias, hidden_states, hidden_states_scale,
-    gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale,
-    T, ne, N1, K1, N2, K2, H, ls, rsf,
-    bufs, ext, device,
-):
-    """MegaMoE pipeline — scaffolded variant of `_run_pipeline_dynamic`.
-
-    Runs route → dispatch → gather identically to the dynamic path, then
-    populates the flat-tile-list from the per-expert offsets. The resulting
-    tile list is available in `bufs["megamoe_tile_{expert,mstart,count}"]`
-    for the upcoming custom CuTe kernel to consume.
-
-    THIS IS SUBSTRATE ONLY. GEMM1 / SwiGLU / GEMM2 still delegate to the
-    existing MxF8 / helper path. The next session replaces this block with
-    a persistent CuTe kernel per HANDOFF_MEGAMOE_PLAN.md Phase A.
-    """
-    # Share the route/dispatch/gather/GEMM/SwiGLU/scatter code with
-    # _run_pipeline_dynamic to avoid duplication while the custom kernel
-    # is not yet implemented. We re-enter _run_pipeline_dynamic with an
-    # env marker set so it knows to also populate the flat-tile-list.
-    prev = os.environ.get("_MEGAMOE_ACTIVE")
-    os.environ["_MEGAMOE_ACTIVE"] = "1"
-    try:
-        if os.environ.get("MEGAMOE_DEBUG"):
-            print(f"[MEGAMOE] _run_megamoe_pipeline entry T={T}", flush=True)
-        return _run_pipeline_dynamic(
-            routing_logits, routing_bias, hidden_states, hidden_states_scale,
-            gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale,
-            T, ne, N1, K1, N2, K2, H, ls, rsf, bufs, ext, device)
-    finally:
-        if prev is None:
-            os.environ.pop("_MEGAMOE_ACTIVE", None)
-        else:
-            os.environ["_MEGAMOE_ACTIVE"] = prev
-
-
-def _megamoe_populate_tile_list(bufs, ext, block_m, fused=False):
-    """Populate (expert, m_start, n_tile) triples into the flat-tile-list.
-
-    Called inside `_run_pipeline_dynamic` when `_MEGAMOE_ACTIVE` is set.
-    Each entry corresponds to ONE grid block in megamoe_gemm1 — it does NOT
-    sweep N-tiles internally.
-
-    `fused=True`: emits out-n-tile indices in [0, I/BLK_N=16), for the fused
-    GEMM1+SwiGLU kernel (each CTA produces one 128-col block of FP8 act_q).
-    `fused=False`: emits n-tile indices in [0, N/BLK_N=32) for the middle
-    variant that produces BF16 gemm1_out.
-    """
-    n_tiles = (int(bufs["megamoe_fused_n_tiles_per_expert"]) if fused
-               else int(bufs["megamoe_n_tiles_per_expert"]))
-    ext.moe_flat_tile_list_mn(
-        bufs["offsets_buf"],
-        bufs["megamoe_tile_expert"],
-        bufs["megamoe_tile_mstart"],
-        bufs["megamoe_tile_ntile"],
-        bufs["megamoe_tile_count"],
-        int(block_m),
-        n_tiles,
-    )
-
-
 def _run_pipeline_dynamic(
     routing_logits, routing_bias, hidden_states, hidden_states_scale,
     gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale,
@@ -6809,17 +6452,10 @@ def _run_pipeline_dynamic(
     async_chunk_experts = int(os.environ.get("ASYNC_STREAM_CHUNK_EXPERTS", "0"))
     stream_chunk_experts = int(os.environ.get("STREAM_CHUNK_EXPERTS", "0"))
     # MxF8 path: hardware block-scaled MMA via tcgen05.mma.kind.mxf8f6f4.
-    # Requires transcoded activations + weights (sign flip + residual
-    # absorbed into payload). Contest scales are signed fp32 but Central
-    # Limit Theorem over K=7168 amortizes the re-quantization error; T=1 and
-    # very small T regress (no averaging).
-    # Default ON for large T since the fused pipeline (gather→MxF8 GEMM1,
-    # swiglu→MxF8 GEMM2) hits hardware peak throughput. Set USE_MXF8=0 to
-    # disable.
+    # Activations and weights are transcoded into signed FP8 payloads plus
+    # UE8M0 scales; the path is used only where setup cost is amortized.
     use_mxf8 = bool(int(os.environ.get("USE_MXF8", "1"))) and T >= int(
         os.environ.get("MXF8_MIN_T", "4096"))
-    if os.environ.get("MXF8_TRACE") and use_mxf8:
-        print(f"[MXF8] T={T} use_mxf8=True", flush=True)
     if async_chunk_experts > 0 and not use_fused_dispatch_gather and not use_mxf8:
         return _run_async_streaming_chunked_pipeline(
             hidden_states,
@@ -6922,7 +6558,6 @@ def _run_pipeline_dynamic(
         )
 
     gemm1_out = bufs["gemm1_out"][:total_valid]
-    _megamoe_fused_skipped_swiglu = False
     prev_cfg_mode = os.environ.get("CUTLASS_CFG_MODE")
     try:
         if segmented_gemm1:
@@ -6982,22 +6617,16 @@ def _run_pipeline_dynamic(
                     bufs["workspace"],
                 )
             else:
-                # Default bf16-out MxF8 path.
-                    # Default bf16-out path.
-                    ext.moe_mxf8_grouped_mm_prepacked(
-                        gemm1_out,
-                        packed_acts, bufs["mxf8_gemm1_w_tr"],
-                        bufs["problem_sizes_1"],
-                        bufs["mxf8_gemm1_a_ptrs"], bufs["mxf8_gemm1_b_ptrs"], bufs["mxf8_gemm1_out_ptrs"],
-                        bufs["mxf8_gemm1_sfa_ptrs"], bufs["mxf8_gemm1_sfb_ptrs"],
-                        bufs["mxf8_stride_a"], bufs["mxf8_stride_b"], bufs["mxf8_stride_c"],
-                        bufs["mxf8_layout_sfa_1"], bufs["mxf8_layout_sfb_1"],
-                        bufs["workspace"],
-                    )
-                    if os.environ.get("MEGAMOE_SNAPSHOT"):
-                        globals()["_MEGAMOE_GEMM1_OUT_SNAPSHOT"] = gemm1_out.clone()
-                        globals()["_MEGAMOE_TOTAL_VALID_SNAPSHOT"] = int(total_valid)
-                        globals()["_MEGAMOE_OFFSETS_SNAPSHOT"] = bufs["offsets_buf"].clone()
+                ext.moe_mxf8_grouped_mm_prepacked(
+                    gemm1_out,
+                    packed_acts, bufs["mxf8_gemm1_w_tr"],
+                    bufs["problem_sizes_1"],
+                    bufs["mxf8_gemm1_a_ptrs"], bufs["mxf8_gemm1_b_ptrs"], bufs["mxf8_gemm1_out_ptrs"],
+                    bufs["mxf8_gemm1_sfa_ptrs"], bufs["mxf8_gemm1_sfb_ptrs"],
+                    bufs["mxf8_stride_a"], bufs["mxf8_stride_b"], bufs["mxf8_stride_c"],
+                    bufs["mxf8_layout_sfa_1"], bufs["mxf8_layout_sfb_1"],
+                    bufs["workspace"],
+                )
         else:
             ext.moe_blockwise_grouped_mm_v2(
                 gemm1_out,
@@ -7015,14 +6644,9 @@ def _run_pipeline_dynamic(
         act_q = bufs["act_q"][:total_valid]
         row_scales = bufs["row_scales"][:total_valid]
         act_scale_for_gemm2 = bufs["act_scale_for_gemm2"][:total_valid]
-        # v17: fold routing weight into A scale of GEMM2 -> unweighted reduce_scatter.
+        # Fold routing weights into GEMM2 input scales so reduce-scatter is unweighted.
         use_weighted_fold = bool(int(os.environ.get("V17_WEIGHTED_FOLD", "1")))
-        if _megamoe_fused_skipped_swiglu:
-            # Fused kernel already produced act_q + act_scales_ue8m0 + SFA buffer.
-            # act_scale_for_gemm2 buffer was aliased to mxf8_gemm2_act_scales_ue8m0.
-            mxf8_gemm2_act_scales_ue8m0 = bufs["mxf8_gemm2_act_scales_ue8m0"][:total_valid]
-            # GEMM2 setup was done inside the fused branch above; nothing to do here.
-        elif use_mxf8 and use_weighted_fold:
+        if use_mxf8 and use_weighted_fold:
             # Fused: swiglu + fp8 requant + MxF8 transcode + SFA pack in ONE kernel.
             mxf8_gemm2_act_scales_ue8m0 = bufs["mxf8_gemm2_act_scales_ue8m0"][:total_valid]
             ext.compute_mxf8_sf_offsets_device(
